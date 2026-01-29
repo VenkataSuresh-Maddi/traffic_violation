@@ -1,15 +1,23 @@
+# Python cache
 __pycache__/
 *.pyc
 .DS_Store
-.env
 
-# Ignore uploads & outputs
-uploads/
-outputs/
+# Datasets
+data/
+dataset/
+datasets/
+
+# Training outputs
 runs/
+outputs/
+uploads/
 
-# Ignore videos
+# Videos
 *.mp4
 *.avi
 *.mov
+
+# Logs
+*.log
 
