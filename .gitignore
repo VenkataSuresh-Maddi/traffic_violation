@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+
+# Ignore uploads & outputs
+uploads/
+outputs/
+runs/
+
+# Ignore videos
+*.mp4
+*.avi
+*.mov
+
