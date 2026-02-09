@@ -1,8 +1,5 @@
-ultralytics>=8.0.0
-opencv-python
-easyocr
-numpy
-torch
-torchvision
 Flask>=2.3.0
-Werkzeug>=2.3.0
+ultralytics>=8.0.0
+opencv-python-headless
+numpy
+gunicorn

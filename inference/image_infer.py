@@ -1,21 +1,44 @@
 import cv2
+import os
 from ultralytics import YOLO
 from utils.draw_boxes import draw_boxes
 
-model = YOLO("models/best.pt")
+def process_image(image_path, model, output_dir="outputs/images", confidence=0.25):
+    """
+    Processes a single image for helmet detection, saves the output, and returns the path.
 
-image_path = input("Enter image path: ")
-image = cv2.imread(image_path)
+    Args:
+        image_path (str): The path to the input image.
+        model (YOLO): The YOLOv8 model instance.
+        output_dir (str): The directory to save the processed image.
+        confidence (float): The confidence threshold for detection.
 
-if image is None:
-	print("❌ Could not read image. Check the file path and try again.")
-else:
-	results = model(image)
-	output = draw_boxes(image, results)
+    Returns:
+        str: The path to the processed image, or None if an error occurs.
+    """
+    try:
+        # Read the image
+        frame = cv2.imread(image_path)
+        if frame is None:
+            print(f"Error: Could not read image from {image_path}")
+            return None
 
-	cv2.imshow("Helmet Detection", output)
-	cv2.imwrite("outputs/images/result.jpg", output)
-	cv2.waitKey(0)
-	cv2.destroyAllWindows()
+        # Perform inference
+        results = model(frame, verbose=False)
 
-	print("✅ Image saved to outputs/images/")
+        # Draw bounding boxes on the frame
+        processed_frame = draw_boxes(frame, results, conf_threshold=confidence)
+
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Save the processed frame
+        base_filename = os.path.basename(image_path)
+        output_filename = f"processed_{base_filename}"
+        output_path = os.path.join(output_dir, output_filename)
+        cv2.imwrite(output_path, processed_frame)
+
+        return output_path
+    except Exception as e:
+        print(f"An error occurred during image processing: {e}")
+        return None
