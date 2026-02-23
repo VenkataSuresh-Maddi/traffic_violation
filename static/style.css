@@ -194,3 +194,35 @@ button:disabled {
     font-size: 1.2em;
 }
 
+.container {
+    width: 80%;
+    margin: auto;
+    font-family: Arial, sans-serif;
+}
+
+.tab-content {
+    display: none;
+    margin-top: 20px;
+}
+
+.tabs button {
+    padding: 10px 15px;
+    margin-right: 5px;
+}
+
+.image-compare {
+    display: flex;
+    gap: 20px;
+    margin-top: 15px;
+}
+
+.image-compare div {
+    width: 50%;
+    text-align: center;
+}
+
+.image-compare img {
+    width: 100%;
+    border: 2px solid #ddd;
+    border-radius: 6px;
+}

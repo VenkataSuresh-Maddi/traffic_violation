@@ -6,7 +6,7 @@ This document provides a comprehensive overview of the Traffic Violation Detecti
 
 The application follows a client-server architecture:
 
--   **Backend:** A Flask web server written in Python manages the core logic. It handles file uploads, runs the AI model, processes media (images, videos), and streams results back to the user.
+-   **Backend:** A Flask web server written in Python manages the core logic. It is located in `inference/app.py`. It handles file uploads, runs the AI model, processes media (images, videos), and streams results back to the user.
 -   **Frontend:** A simple web interface built with HTML, CSS, and JavaScript allows users to interact with the system. Users can upload images or videos, or start a webcam feed for real-time detection.
 -   **AI Model:** A pre-trained YOLOv8 model (`best.pt`) is used for object detection. The model is optimized for identifying two classes: `helmet` and `nohelmet`.
 
