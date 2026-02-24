@@ -3,21 +3,3 @@ __pycache__/
 *.pyc
 .DS_Store
 
-# Datasets
-data/
-dataset/
-datasets/
-
-# Training outputs
-runs/
-outputs/
-uploads/
-
-# Videos
-*.mp4
-*.avi
-*.mov
-
-# Logs
-*.log
-

@@ -1,8 +1,10 @@
 import cv2
 from ultralytics import YOLO
+from utils.ocr import read_plate
 
 vehicle_model = YOLO("yolov8n.pt")
 helmet_model  = YOLO("models/best.pt")
+plate_model   = YOLO("models/plate_best.pt")
 
 TWO_WHEELER_CLASSES = [1, 3]
 
@@ -84,6 +86,50 @@ def generate_frames(conf, stop_flag):
             vx1, vy1, vx2, vy2 = v["box"]
             cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), (0, 255, 255), 2)
             cv2.putText(frame, "Two-Wheeler", (vx1, vy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+            if v["has_violation"]:
+                motorcycle_crop = frame[vy1:vy2, vx1:vx2]
+                if motorcycle_crop.size == 0:
+                    continue
+
+                plate_results = plate_model(motorcycle_crop, conf=0.01)[0]
+                if len(plate_results.boxes) == 0:
+                    continue
+                    
+                best_pbox = None
+                best_pconf = -1
+                
+                for pbox in plate_results.boxes:
+                    conf = float(pbox.conf[0])
+                    if conf > best_pconf:
+                        best_pconf = conf
+                        best_pbox = pbox
+
+                if best_pbox is not None:
+                    px1, py1, px2, py2 = map(int, best_pbox.xyxy[0])
+                    plate_crop = motorcycle_crop[py1:py2, px1:px2]
+
+                    if plate_crop.size > 0:
+                        plate_num = read_plate(plate_crop)
+
+                        # Translate plate coordinates to original image space
+                        global_px1, global_py1 = vx1 + px1, vy1 + py1
+                        global_px2, global_py2 = vx1 + px2, vy1 + py2
+
+                        # Draw plate box (BLUE)
+                        cv2.rectangle(frame, (global_px1, global_py1), (global_px2, global_py2), (255, 0, 0), 2)
+
+                        if plate_num:
+                            cv2.putText(
+                                frame,
+                                plate_num,
+                                (global_px1, global_py1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.9,
+                                (255, 0, 0),
+                                2,
+                                cv2.LINE_AA
+                            )
 
         _, buffer = cv2.imencode(".jpg", frame)
         yield (

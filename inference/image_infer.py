@@ -112,38 +112,47 @@ def process_image(input_path, output_path, conf):
             if motorcycle_crop.size == 0:
                 continue
 
-            plate_results = plate_model(motorcycle_crop, conf=0.3)[0]
-
+            plate_results = plate_model(motorcycle_crop, conf=0.01)[0]
+            if len(plate_results.boxes) == 0:
+                continue
+                
+            # Find the single plate bounding box with the highest confidence
+            best_pbox = None
+            best_pconf = -1
+            
             for pbox in plate_results.boxes:
-                px1, py1, px2, py2 = map(int, pbox.xyxy[0])
+                conf = float(pbox.conf[0])
+                if conf > best_pconf:
+                    best_pconf = conf
+                    best_pbox = pbox
+            
+            if best_pbox is not None:
+                px1, py1, px2, py2 = map(int, best_pbox.xyxy[0])
                 plate_crop = motorcycle_crop[py1:py2, px1:px2]
 
-                if plate_crop.size == 0:
-                    continue
+                if plate_crop.size > 0:
+                    plate_num = read_plate(plate_crop)
+                    if plate_num and not plate_number_found:
+                        plate_number_found = plate_num # Keep first plate found for summary
 
-                plate_num = read_plate(plate_crop)
-                if plate_num and not plate_number_found:
-                    plate_number_found = plate_num # Keep first plate found for summary
+                    # Translate plate coordinates to original image space
+                    global_px1, global_py1 = vx1 + px1, vy1 + py1
+                    global_px2, global_py2 = vx1 + px2, vy1 + py2
 
-                # Translate plate coordinates to original image space
-                global_px1, global_py1 = vx1 + px1, vy1 + py1
-                global_px2, global_py2 = vx1 + px2, vy1 + py2
+                    # Draw plate box (BLUE)
+                    cv2.rectangle(output_image, (global_px1, global_py1), (global_px2, global_py2), (255, 0, 0), 2)
 
-                # Draw plate box (BLUE)
-                cv2.rectangle(output_image, (global_px1, global_py1), (global_px2, global_py2), (255, 0, 0), 2)
-
-                if plate_num:
-                    cv2.putText(
-                        output_image,
-                        plate_num,
-                        (global_px1, global_py1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.9,
-                        (255, 0, 0),
-                        2,
-                        cv2.LINE_AA
-                    )
-                break
+                    if plate_num:
+                        cv2.putText(
+                            output_image,
+                            plate_num,
+                            (global_px1, global_py1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.9,
+                            (255, 0, 0),
+                            2,
+                            cv2.LINE_AA
+                        )
 
     cv2.imwrite(output_path, output_image)
     return total_violations, plate_number_found
