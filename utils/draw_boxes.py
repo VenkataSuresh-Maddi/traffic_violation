@@ -9,22 +9,30 @@ def draw_detections(image, results):
     count = 0
 
     for box in results.boxes:
-        cls_id = int(box.cls[0])
-        label = results.names[cls_id].lower()
+        # Get label safely
+        label = results.names[int(box.cls[0])].lower()
         conf = float(box.conf[0])
 
-        if label not in ["helmet", "nohelmet"]:
+        # Accept ANY helmet / no-helmet naming
+        if "helmet" not in label:
             continue
 
         x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-        color = GREEN if label == "helmet" else RED
-        text = f"{label.capitalize()}: {conf:.2f}"
+        # Decide color
+        if "no" in label:
+            color = RED
+            is_violation = True
+        else:
+            color = GREEN
+            is_violation = False
 
-        # ---- Bounding box ----
+        text = f"{label.replace('_', ' ').title()}: {conf:.2f}"
+
+        # Draw bounding box
         cv2.rectangle(image, (x1, y1), (x2, y2), color, 3)
 
-        # ---- Text size ----
+        # Text size
         (tw, th), _ = cv2.getTextSize(
             text,
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -32,7 +40,7 @@ def draw_detections(image, results):
             2
         )
 
-        # ---- Text background ----
+        # Background for text
         cv2.rectangle(
             image,
             (x1, y1 - th - 10),
@@ -41,7 +49,7 @@ def draw_detections(image, results):
             -1
         )
 
-        # ---- Text ----
+        # Put text
         cv2.putText(
             image,
             text,
@@ -53,6 +61,7 @@ def draw_detections(image, results):
             cv2.LINE_AA
         )
 
-        count += 1
+        if is_violation:
+            count += 1
 
     return image, count

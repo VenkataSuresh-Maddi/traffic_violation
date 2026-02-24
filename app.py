@@ -33,9 +33,14 @@ def detect_image():
     op = os.path.join(OUT_IMG, "processed_" + img.filename)
 
     img.save(ip)
-    count = process_image(ip, op, conf)
+    count, plate_number = process_image(ip, op, conf)
 
-    msg = "No violations detected" if count == 0 else f"Detections: {count}"
+    if count == 0:
+        msg = "No violations detected"
+    else:
+        msg = f"Detections: {count}"
+        if plate_number:
+            msg += f" (Plate: {plate_number})"
 
     return jsonify({
         "original": f"/uploads/{img.filename}",
@@ -98,4 +103,4 @@ def serve_output_image(f):
 
 
 if __name__ == "__main__":
-    app.run(port=5050, debug=True)
+    app.run(port=5055, debug=True)

@@ -1,8 +1,10 @@
 import cv2
 from ultralytics import YOLO
-from utils.draw_boxes import draw_detections
 
-model = YOLO("models/best.pt")
+vehicle_model = YOLO("yolov8n.pt")
+helmet_model  = YOLO("models/best.pt")
+
+TWO_WHEELER_CLASSES = [1, 3]
 
 def generate_frames(conf, stop_flag):
     cap = cv2.VideoCapture(0)
@@ -15,8 +17,73 @@ def generate_frames(conf, stop_flag):
         if not ret:
             break
 
-        results = model(frame, conf=conf)[0]
-        frame, _ = draw_detections(frame, results)
+        vehicle_results = vehicle_model(frame, conf=conf, classes=TWO_WHEELER_CLASSES)[0]
+        helmet_results = helmet_model(frame, conf=conf)[0]
+
+        vehicles = []
+        for vbox in vehicle_results.boxes:
+            vx1, vy1, vx2, vy2 = map(int, vbox.xyxy[0])
+            vehicles.append({
+                "box": (vx1, vy1, vx2, vy2),
+                "has_violation": False
+            })
+
+        def get_distance(h_box, v_box):
+            h_center_x = (h_box[0] + h_box[2]) / 2.0
+            v_center_x = (v_box[0] + v_box[2]) / 2.0
+            h_bottom_y = h_box[3]
+            v_top_y = v_box[1]
+            x_dist = abs(h_center_x - v_center_x)
+            y_dist = max(0, v_top_y - h_bottom_y)
+            return x_dist, y_dist
+
+        for hbox in helmet_results.boxes:
+            hx1, hy1, hx2, hy2 = map(int, hbox.xyxy[0])
+            h_box = (hx1, hy1, hx2, hy2)
+
+            matched_vehicle = None
+            min_distance = float('inf')
+            
+            for v in vehicles:
+                vx1, vy1, vx2, vy2 = v["box"]
+                v_width = vx2 - vx1
+                v_height = vy2 - vy1
+                
+                x_dist, y_dist = get_distance(h_box, v["box"])
+                
+                # Match if the helmet is horizontally strictly aligned with the bike's center (v_width * 0.5) 
+                # and vertically within a tight logical distance physically touching or right above it (v_height * 0.5)
+                # This strict constraint prevents pedestrians on the sidewalk from linking to motorcycles.
+                if x_dist < v_width * 0.6 and y_dist < v_height * 0.6:
+                    total_dist = x_dist + y_dist
+                    if total_dist < min_distance:
+                        min_distance = total_dist
+                        matched_vehicle = v
+                    
+            if not matched_vehicle:
+                continue
+
+            label = helmet_results.names[int(hbox.cls[0])].lower()
+            h_conf = float(hbox.conf[0])
+
+            if "no" in label:
+                color = (0, 0, 255) # RED
+                matched_vehicle["has_violation"] = True
+            else:
+                color = (0, 255, 0) # GREEN
+
+            text = f"{label.replace('_', ' ').title()}: {h_conf:.2f}"
+            cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), color, 3)
+            
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(frame, (hx1, hy1 - th - 10), (hx1 + tw + 6, hy1), color, -1)
+            cv2.putText(frame, text, (hx1 + 3, hy1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+        for v in vehicles:
+            vx1, vy1, vx2, vy2 = v["box"]
+            cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), (0, 255, 255), 2)
+            cv2.putText(frame, "Two-Wheeler", (vx1, vy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         _, buffer = cv2.imencode(".jpg", frame)
         yield (
