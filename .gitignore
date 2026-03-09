@@ -1,27 +1,19 @@
 # datasets
 data/
-dataset/
-images/
-videos/
 
 # models
+models/
 *.pt
-*.pth
-*.weights
+
+# outputs
+outputs/
+
+# uploads
+uploads/
 
 # python cache
 __pycache__/
 *.pyc
 
-# mac files
+# mac
 .DS_Store
-
-# outputs
-runs/
-outputs/
-results/
-
-# virtual environment
-venv/
-env/
-.venv/
