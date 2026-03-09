@@ -1,19 +1,17 @@
-# datasets
+# Large folders
 data/
-
-# models
 models/
-*.pt
-
-# outputs
 outputs/
-
-# uploads
 uploads/
 
-# python cache
+# YOLO models
+*.pt
+*.pth
+*.weights
+
+# Python cache
 __pycache__/
 *.pyc
 
-# mac
+# Mac files
 .DS_Store
