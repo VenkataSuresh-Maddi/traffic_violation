@@ -1,5 +1,27 @@
-# Python cache
+# datasets
+data/
+dataset/
+images/
+videos/
+
+# models
+*.pt
+*.pth
+*.weights
+
+# python cache
 __pycache__/
 *.pyc
+
+# mac files
 .DS_Store
 
+# outputs
+runs/
+outputs/
+results/
+
+# virtual environment
+venv/
+env/
+.venv/
