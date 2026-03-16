@@ -1,8 +1,10 @@
-Flask>=2.3.0
-ultralytics>=8.0.0
+Flask==2.3.3
+gunicorn
+ultralytics
 opencv-python-headless
 numpy
-gunicorn
 easyocr
 torch
 torchvision
+pillow
+scipy
