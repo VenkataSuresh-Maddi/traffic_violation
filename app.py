@@ -1,6 +1,7 @@
 import os
 import warnings
 warnings.filterwarnings("ignore", message="'pin_memory' argument is set as true")
+
 from flask import Flask, request, jsonify, Response, send_file, render_template
 from inference.image_infer import process_image
 from inference.video_infer import process_video
@@ -21,6 +22,7 @@ STOP_WEBCAM = False
 _video_progress = {"current": 0, "total": 0}
 
 
+# -------- HOME --------
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -57,6 +59,7 @@ def detect_image():
 @app.route("/detect_video", methods=["POST"])
 def detect_video():
     global PROCESSED_VIDEO, _video_progress
+
     vid = request.files["video"]
     conf = float(request.form.get("confidence", 0.25))
 
@@ -80,8 +83,14 @@ def detect_video():
 def video_progress():
     current = _video_progress["current"]
     total = _video_progress["total"]
+
     pct = int(current / total * 100) if total > 0 else 0
-    return jsonify({"current": current, "total": total, "percent": pct})
+
+    return jsonify({
+        "current": current,
+        "total": total,
+        "percent": pct
+    })
 
 
 @app.route("/play_video")
@@ -94,6 +103,7 @@ def play_video():
 def webcam_feed():
     global STOP_WEBCAM
     STOP_WEBCAM = False
+
     conf = float(request.args.get("confidence", 0.25))
 
     return Response(
@@ -120,5 +130,7 @@ def serve_output_image(f):
     return send_file(os.path.join(OUT_IMG, f))
 
 
+# -------- RUN SERVER --------
 if __name__ == "__main__":
-    app.run(port=5055, debug=False, threaded=True)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
