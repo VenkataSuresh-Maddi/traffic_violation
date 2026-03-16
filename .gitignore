@@ -1,23 +1,17 @@
-# Python cache
-__pycache__/
-*.pyc
-.DS_Store
-
-# Datasets
+# Large folders
 data/
-dataset/
-datasets/
-
-# Training outputs
-runs/
+models/
 outputs/
 uploads/
 
-# Videos
-*.mp4
-*.avi
-*.mov
+# YOLO models
+*.pt
+*.pth
+*.weights
 
-# Logs
-*.log
+# Python cache
+__pycache__/
+*.pyc
 
+# Mac files
+.DS_Store

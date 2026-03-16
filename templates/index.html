@@ -2,72 +2,127 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Traffic Violation Detection System</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@400;600;700;900&family=Barlow+Condensed:wght@700;900&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
 
-<div class="container">
-    <h1>🚦 Traffic Violation Detection System</h1>
-    <p>Using YOLOv8 for Helmet Detection</p>
+<div class="scanline"></div>
+<div class="noise"></div>
 
-    <div class="tabs">
-        <button class="tab-link" onclick="openTab(event,'image-tab')">🖼 Image</button>
-        <button class="tab-link" onclick="openTab(event,'video-tab')">📹 Video</button>
-        <button class="tab-link" onclick="openTab(event,'webcam-tab')">📷 Webcam</button>
-    </div>
+<div class="shell">
 
-    <!-- IMAGE -->
-    <div id="image-tab" class="tab-content">
-        <h2>Upload Image</h2>
-
-        <label>Confidence:
-            <span id="image-conf-value">0.25</span>
-        </label>
-        <input type="range" id="image-conf" class="conf-slider" min="0.05" max="1" step="0.05" value="0.25">
-
-        <form id="image-form" enctype="multipart/form-data">
-            <input type="file" name="image" required>
-            <button type="submit">Detect Violations</button>
-        </form>
-
-        <div id="image-results"></div>
-    </div>
-
-    <!-- VIDEO -->
-    <div id="video-tab" class="tab-content">
-        <h2>Upload Video</h2>
-
-        <label>Confidence:
-            <span id="video-conf-value">0.25</span>
-        </label>
-        <input type="range" id="video-conf" class="conf-slider" min="0.05" max="1" step="0.05" value="0.25">
-
-        <form id="video-form" enctype="multipart/form-data">
-            <input type="file" name="video" required>
-            <button type="submit">Process Video</button>
-        </form>
-
-        <div id="video-results"></div>
-    </div>
-
-    <!-- WEBCAM -->
-    <div id="webcam-tab" class="tab-content">
-        <h2>Webcam</h2>
-
-        <label>Confidence:
-            <span id="webcam-conf-value">0.25</span>
-        </label>
-        <input type="range" id="webcam-conf" class="conf-slider" min="0.05" max="1" step="0.05" value="0.25">
-
-        <br><br>
-        <button id="start-webcam">Start</button>
-        <button id="stop-webcam" style="display:none;">Stop</button>
-
-        <div id="webcam-feed-container" style="display:none;">
-            <img id="webcam-feed">
+    <!-- HEADER -->
+    <header class="site-header">
+        <div class="header-left">
+            <span class="status-dot"></span>
+            <span class="status-text">SYSTEM ONLINE</span>
         </div>
-    </div>
+        <div class="header-center">
+            <div class="logo-badge">
+                <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+                    <polygon points="16,2 30,26 2,26" stroke="#f7c32e" stroke-width="2" fill="none"/>
+                    <line x1="16" y1="10" x2="16" y2="18" stroke="#f7c32e" stroke-width="2"/>
+                    <circle cx="16" cy="22" r="1.5" fill="#f7c32e"/>
+                </svg>
+            </div>
+            <div class="logo-text">
+                <h1>TRAFFIC VIOLATION DETECTION</h1>
+                <p>YOLOv8 &middot; Real-Time Helmet Compliance &middot; License Plate OCR</p>
+            </div>
+        </div>
+        <div class="header-right">
+            <span class="mono" id="live-clock"></span>
+        </div>
+    </header>
+
+    <!-- TAB NAV -->
+    <nav class="tab-nav">
+        <button class="tab-btn" data-tab="image-tab">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+            Image
+        </button>
+        <button class="tab-btn" data-tab="video-tab">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+            Video
+        </button>
+        <button class="tab-btn" data-tab="webcam-tab">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+            Webcam
+        </button>
+    </nav>
+
+    <!-- IMAGE TAB -->
+    <section id="image-tab" class="tab-panel">
+        <div class="panel-body">
+            <div class="control-block">
+                <form id="image-form" enctype="multipart/form-data">
+                    <label class="file-drop" for="image-file-input">
+                        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                        <span class="drop-main">Drop image here or <u>browse</u></span>
+                        <span class="drop-sub mono" id="image-filename">No file selected</span>
+                        <input type="file" id="image-file-input" name="image" accept="image/*" required style="display:none">
+                    </label>
+                    <button type="submit" class="btn-primary" id="image-submit-btn">ANALYSE IMAGE</button>
+                </form>
+            </div>
+            <div class="results-block" id="image-results">
+                <div class="empty-state">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                    <p>Upload an image to begin detection</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- VIDEO TAB -->
+    <section id="video-tab" class="tab-panel">
+        <div class="panel-body">
+            <div class="control-block">
+                <form id="video-form" enctype="multipart/form-data">
+                    <label class="file-drop" for="video-file-input">
+                        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+                        <span class="drop-main">Drop video here or <u>browse</u></span>
+                        <span class="drop-sub mono" id="video-filename">No file selected</span>
+                        <input type="file" id="video-file-input" name="video" accept="video/*" required style="display:none">
+                    </label>
+                    <button type="submit" class="btn-primary" id="video-submit-btn">PROCESS VIDEO</button>
+                </form>
+            </div>
+            <div class="results-block" id="video-results">
+                <div class="empty-state">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+                    <p>Upload a video to begin detection</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- WEBCAM TAB -->
+    <section id="webcam-tab" class="tab-panel">
+        <div class="panel-body">
+            <div class="control-block">
+                <div class="webcam-btns">
+                    <button class="btn-primary" id="start-webcam">START WEBCAM</button>
+                    <button class="btn-danger" id="stop-webcam" style="display:none">STOP WEBCAM</button>
+                </div>
+            </div>
+            <div class="results-block" id="webcam-results">
+                <div class="empty-state" id="webcam-empty">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+                    <p>Start webcam to begin live detection</p>
+                </div>
+                <div id="webcam-feed-container" style="display:none">
+                    <img id="webcam-feed" class="webcam-img" alt="Webcam feed">
+                </div>
+            </div>
+        </div>
+    </section>
+
 </div>
 
 <script src="{{ url_for('static', filename='script.js') }}"></script>

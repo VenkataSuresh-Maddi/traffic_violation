@@ -1,4 +1,6 @@
 import os
+import warnings
+warnings.filterwarnings("ignore", message="'pin_memory' argument is set as true")
 from flask import Flask, request, jsonify, Response, send_file, render_template
 from inference.image_infer import process_image
 from inference.video_infer import process_video
@@ -16,6 +18,7 @@ os.makedirs(OUT_VID, exist_ok=True)
 
 PROCESSED_VIDEO = None
 STOP_WEBCAM = False
+_video_progress = {"current": 0, "total": 0}
 
 
 @app.route("/")
@@ -33,7 +36,7 @@ def detect_image():
     op = os.path.join(OUT_IMG, "processed_" + img.filename)
 
     img.save(ip)
-    count, plate_number = process_image(ip, op, conf)
+    count, plate_number, stats = process_image(ip, op, conf)
 
     if count == 0:
         msg = "No violations detected"
@@ -45,14 +48,15 @@ def detect_image():
     return jsonify({
         "original": f"/uploads/{img.filename}",
         "processed": f"/outputs/images/{os.path.basename(op)}",
-        "message": msg
+        "message": msg,
+        "stats": stats
     })
 
 
 # -------- VIDEO --------
 @app.route("/detect_video", methods=["POST"])
 def detect_video():
-    global PROCESSED_VIDEO
+    global PROCESSED_VIDEO, _video_progress
     vid = request.files["video"]
     conf = float(request.form.get("confidence", 0.25))
 
@@ -60,10 +64,24 @@ def detect_video():
     op = os.path.join(OUT_VID, "processed.mp4")
 
     vid.save(ip)
-    process_video(ip, op, conf)
+    _video_progress = {"current": 0, "total": 0}
+
+    def on_progress(current, total):
+        _video_progress["current"] = current
+        _video_progress["total"] = total
+
+    stats = process_video(ip, op, conf, progress_callback=on_progress)
     PROCESSED_VIDEO = op
 
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "stats": stats})
+
+
+@app.route("/video_progress")
+def video_progress():
+    current = _video_progress["current"]
+    total = _video_progress["total"]
+    pct = int(current / total * 100) if total > 0 else 0
+    return jsonify({"current": current, "total": total, "percent": pct})
 
 
 @app.route("/play_video")
@@ -103,4 +121,4 @@ def serve_output_image(f):
 
 
 if __name__ == "__main__":
-    app.run(port=5055, debug=True)
+    app.run(port=5055, debug=False, threaded=True)
