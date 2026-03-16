@@ -132,5 +132,4 @@ def serve_output_image(f):
 
 # -------- RUN SERVER --------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=7860, debug=False, threaded=True)
