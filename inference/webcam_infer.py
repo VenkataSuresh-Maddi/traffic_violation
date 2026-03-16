@@ -2,6 +2,10 @@
 Webcam inference for traffic violation detection.
 Uses VehicleTracker to count unique vehicles with no double-counting.
 
+Stability update:
+- Vehicle and helmet model calls run sequentially to avoid macOS/MPS
+    concurrency-related crashes.
+
 Fixes applied vs previous version:
 - device="mps" on all model calls (GPU acceleration)
 - has_any_helmet logic: vehicle with no helmet match = violation
@@ -11,10 +15,9 @@ Fixes applied vs previous version:
 
 import os
 from datetime import datetime
-
 import cv2
 
-from inference.models import vehicle_model, helmet_model, plate_model
+from inference.models import MODEL_DEVICE, vehicle_model, helmet_model, plate_model
 from inference.tracker import VehicleTracker
 from utils.ocr import read_plate
 
@@ -115,7 +118,7 @@ def _helmet_distance(h_box, v_box):
 def _best_plate_in_crop(crop):
     if crop is None or crop.size == 0:
         return None
-    results = plate_model(crop, conf=0.01, device="mps")[0]
+    results = plate_model(crop, conf=0.01, device=MODEL_DEVICE)[0]
     if not results.boxes:
         return None
     best_conf, best_box = -1, None
@@ -162,12 +165,14 @@ def generate_frames(conf: float, stop_flag):
         fh, fw = frame.shape[:2]
         min_area = fw * fh * MIN_AREA_RATIO
 
-        # ── Detect ───────────────────────────────────────────────────────
         vehicle_res = vehicle_model(
-            frame, conf=MIN_VEHICLE_CONF, classes=TWO_WHEELER_CLASSES, device="mps"
+            frame, conf=MIN_VEHICLE_CONF,
+            classes=TWO_WHEELER_CLASSES, device=MODEL_DEVICE
         )[0]
-        helmet_res = helmet_model(frame, conf=conf, device="mps")[0]
-        names      = helmet_res.names
+
+        helmet_res = helmet_model(frame, conf=conf, device=MODEL_DEVICE)[0]
+
+        names = helmet_res.names
 
         if rider_class_exists is None:
             rider_class_exists = any("rider" in names[i].lower() for i in range(len(names)))
@@ -188,7 +193,7 @@ def generate_frames(conf: float, stop_flag):
             })
         vehicles = _nms_vehicles(raw_vehicles)
 
-        # ── Match helmets → vehicles ──────────────────────────────────────
+        # ── Match helmets → vehicles ──────────────────────────────────────────
         for hb in helmet_res.boxes:
             hx1, hy1, hx2, hy2 = map(int, hb.xyxy[0])
             h_box  = (hx1, hy1, hx2, hy2)
@@ -232,14 +237,12 @@ def generate_frames(conf: float, stop_flag):
             cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), color, 2)
             _draw_label(frame, txt, hx1, hy1, color)
 
-        # Only flag violation when model explicitly detects "nohelmet" label.
-
-        # ── Tracker update ───────────────────────────────────────────────
+        # ── Tracker update ───────────────────────────────────────────────────
         dets = [{"box": v["box"], "violation": v["violation"], "plate": v["plate"]}
                 for v in vehicles]
         active_tracks = tracker.update(dets)
 
-        # ── Draw + save evidence ─────────────────────────────────────────
+        # ── Draw + save evidence ─────────────────────────────────────────────
         for v in vehicles:
             vx1, vy1, vx2, vy2 = v["box"]
             track    = next((t for t in active_tracks if t["box"] == v["box"]), None)

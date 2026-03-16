@@ -2,10 +2,16 @@ import os
 import warnings
 warnings.filterwarnings("ignore", message="'pin_memory' argument is set as true")
 
+# Prefer GPU/MPS inference when available; fallback to CPU automatically.
+os.environ.setdefault("TV_FORCE_CPU", "0")
+# Prefer GPU for OCR when available; utils/ocr.py will fallback if unsupported.
+os.environ.setdefault("TV_OCR_GPU", "1")
+
 from flask import Flask, request, jsonify, Response, send_file, render_template
 from inference.image_infer import process_image
 from inference.video_infer import process_video
 from inference.webcam_infer import generate_frames
+from utils.ocr import warm_up
 
 app = Flask(__name__)
 
@@ -16,6 +22,9 @@ OUT_VID = "outputs/videos"
 os.makedirs(UPLOAD, exist_ok=True)
 os.makedirs(OUT_IMG, exist_ok=True)
 os.makedirs(OUT_VID, exist_ok=True)
+
+# ── Startup: warm up EasyOCR so first request isn't slow ──────────────────────
+warm_up()
 
 PROCESSED_VIDEO = None
 STOP_WEBCAM = False

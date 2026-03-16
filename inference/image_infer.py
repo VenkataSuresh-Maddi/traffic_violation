@@ -1,6 +1,9 @@
 """
 Image inference for traffic violation detection.
 
+Stability update:
+- Model calls run sequentially to avoid macOS/MPS concurrency crashes.
+
 Active fixes (no pillion logic):
 - NMS_IOU_THRESH = 0.55  (side-by-side bikes not suppressed)
 - MIN_VEHICLE_CONF = 0.15 (catches partial/edge bikes)
@@ -12,10 +15,9 @@ Active fixes (no pillion logic):
 
 import os
 from datetime import datetime
-
 import cv2
 
-from inference.models import vehicle_model, helmet_model, plate_model
+from inference.models import MODEL_DEVICE, vehicle_model, helmet_model, plate_model
 from utils.ocr import read_plate
 
 TWO_WHEELER_CLASSES = [3]
@@ -105,7 +107,7 @@ def _helmet_distance(h_box, v_box):
 def _best_plate_in_crop(vehicle_crop, vx1, vy1, vx2, vy2):
     if vehicle_crop is None or vehicle_crop.size == 0:
         return None
-    results = plate_model(vehicle_crop, conf=0.01, device="mps")[0]
+    results = plate_model(vehicle_crop, conf=0.01, device=MODEL_DEVICE)[0]
     if not results.boxes:
         return None
     best_conf, best_box = -1, None
@@ -149,13 +151,19 @@ def process_image(input_path: str, output_path: str, conf: float):
     min_area   = frame_area * MIN_AREA_RATIO
     _ensure_output()
 
-    # ── 1. Detect vehicles ───────────────────────────────────────────────────
+    # Use sequential model calls for stability on macOS/MPS.
     vehicle_res = vehicle_model(
         image, conf=MIN_VEHICLE_CONF,
         classes=TWO_WHEELER_CLASSES,
-        imgsz=INFER_SIZE, device="mps"
+        imgsz=INFER_SIZE, device=MODEL_DEVICE
     )[0]
 
+    helmet_res = helmet_model(
+        image, conf=0.10,
+        imgsz=INFER_SIZE, device=MODEL_DEVICE
+    )[0]
+
+    # ── 2. Build vehicle list ────────────────────────────────────────────────
     raw_vehicles = []
     for vb in vehicle_res.boxes:
         x1, y1, x2, y2 = map(int, vb.xyxy[0])
@@ -173,15 +181,10 @@ def process_image(input_path: str, output_path: str, conf: float):
 
     vehicles = _nms_vehicles(raw_vehicles)
 
-    # ── 2. Detect helmets ────────────────────────────────────────────────────
-    helmet_res = helmet_model(
-        image, conf=0.10,
-        imgsz=INFER_SIZE, device="mps"
-    )[0]
+    # ── 3. Match helmets → vehicles ──────────────────────────────────────────
     names = helmet_res.names
     rider_class_exists = any("rider" in names[i].lower() for i in range(len(names)))
 
-    # ── 3. Match helmets → vehicles ──────────────────────────────────────────
     for hb in helmet_res.boxes:
         hx1, hy1, hx2, hy2 = map(int, hb.xyxy[0])
         h_box  = (hx1, hy1, hx2, hy2)
@@ -207,7 +210,6 @@ def process_image(input_path: str, output_path: str, conf: float):
         if best_v is None:
             continue
 
-        # Ignore very weak safe-helmet detections
         if "no" not in label and h_conf < SAFE_HELMET_CONF:
             continue
 

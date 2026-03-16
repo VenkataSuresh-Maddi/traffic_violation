@@ -2,19 +2,24 @@
 OCR module for license plate text extraction.
 Optimized for Indian license plates (TS, AP, KA, MH, DL formats).
 
-All fixes applied:
-1. District slots (3-4) ALWAYS forced to digit (J→0, U→0, etc.)
-2. Series slot: dual-candidate approach — ambiguous 2nd letter (B,S,A,G,etc.)
-   is tried BOTH as a series letter AND as a number digit; best score wins
-3. Score function correctly detects series/number boundary dynamically
-   (handles single-letter series like V, N, W as well as two-letter AB, FY)
-4. 4-digit number strongly preferred over 3-digit (key for KA-03-V-8078)
-5. K/Y disambiguation: K at series-end penalised (Y is more common)
-6. 3x upscale + unsharp-mask sharpening before OCR
-7. Multi-variant voting across 5 preprocessing modes
-8. Fallback cap raised to 12 chars
+Stability improvements:
+1. OCR variants run serially to avoid threaded EasyOCR/Torch crashes.
+2. EasyOCR reader exposed via warm_up() so app.py can init at startup.
+3. _run_ocr_on_variant wrapped in try/except — one bad crop can't
+    break the full OCR pass.
+
+All original accuracy logic preserved:
+- District slots (3-4) ALWAYS forced to digit (J→0, U→0, etc.)
+- Series slot: dual-candidate approach for ambiguous 2nd letter
+- Score function correctly detects series/number boundary dynamically
+- 4-digit number strongly preferred over 3-digit
+- K/Y disambiguation
+- 3x upscale + unsharp-mask sharpening before OCR
+- Multi-variant voting across 5 preprocessing modes
+- Fallback cap raised to 12 chars
 """
 
+import os
 import re
 
 import cv2
@@ -28,10 +33,29 @@ def _get_reader():
     global _reader
     if _reader is None:
         try:
-            _reader = easyocr.Reader(["en"], gpu=True)
+            use_gpu = os.getenv("TV_OCR_GPU", "0") == "1"
+            _reader = easyocr.Reader(["en"], gpu=use_gpu)
         except Exception:
             _reader = easyocr.Reader(["en"], gpu=False)
     return _reader
+
+
+def warm_up():
+    """
+    Call this at app startup to avoid cold-start delay on first request.
+    Forces EasyOCR to initialize and compile its internal model before
+    any request hits.
+
+    Usage in app.py:
+        from utils.ocr import warm_up
+        warm_up()
+    """
+    reader = _get_reader()
+    dummy = np.zeros((32, 128, 3), dtype=np.uint8)
+    try:
+        reader.readtext(dummy)
+    except Exception:
+        pass
 
 
 _INDIAN_PLATE_RE = re.compile(
@@ -151,11 +175,6 @@ def _score_candidate(text: str) -> int:
     """
     Structural quality score for a candidate plate string.
     Dynamically detects where the series ends and number begins.
-
-    Key scoring philosophy:
-    - 4-digit number strongly preferred over 3-digit (prevents ambiguous
-      2nd series char from eating the first number digit)
-    - K at series-end penalised (Y is more common in Indian plates)
     """
     s = "".join(c for c in text.upper() if c.isalnum())
     if len(s) < 5:
@@ -263,10 +282,33 @@ def _preprocess(plate_img: np.ndarray) -> list:
     ]
 
 
+def _run_ocr_on_variant(args):
+    """
+    Worker function for parallel OCR. Runs EasyOCR on a single variant.
+    Returns list of (raw_text, conf) tuples.
+    Wrapped in try/except so one bad crop can't kill other variants.
+    """
+    _name, proc_img, reader = args
+    results = []
+    try:
+        for _, text, conf in reader.readtext(proc_img):
+            if conf < 0.10:
+                continue
+            raw = "".join(c for c in text if c.isalnum()).upper()
+            if len(raw) < 6:
+                continue
+            results.append((raw, conf))
+    except Exception:
+        pass
+    return results
+
+
 def read_plate(plate_img: np.ndarray) -> str:
     """
     Extract Indian license plate text from a cropped plate image.
     Returns plate string (e.g. KA03V8078, TS07FY2960) or '' if unreadable.
+
+    Variants are processed serially for runtime stability.
     """
     if plate_img is None or plate_img.size == 0:
         return ""
@@ -276,23 +318,18 @@ def read_plate(plate_img: np.ndarray) -> str:
         return ""
 
     reader = _get_reader()
+
     candidates: list[tuple[str, int, float]] = []
     raw_fallbacks: list[tuple[str, float]] = []
 
+    # Keep OCR serial for runtime stability with EasyOCR/Torch.
     for _name, proc_img in variants:
-        for _, text, conf in reader.readtext(proc_img):
-            if conf < 0.10:
-                continue
-            raw = "".join(c for c in text if c.isalnum()).upper()
-            if len(raw) < 6:
-                continue
-
-            # Generate all corrected candidates (dual interpretation)
+        variant_results = _run_ocr_on_variant((_name, proc_img, reader))
+        for raw, conf in variant_results:
+            raw_fallbacks.append((raw, conf))
             for corrected in _correct_ocr_mistakes(raw):
-                raw_fallbacks.append((corrected, conf))
                 extracted = _extract_from_string(corrected)
                 if extracted:
-                    # Also generate visual alternates (K↔Y etc.)
                     for alt in _generate_alternates(extracted):
                         score = _score_candidate(alt)
                         candidates.append((alt, score, conf))

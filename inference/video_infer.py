@@ -3,6 +3,10 @@ Video inference for traffic violation detection.
 Uses tiled detection + VehicleTracker to count every unique vehicle
 exactly once across all frames — no double counting.
 
+Stability update:
+- Vehicle and helmet tiled detection run sequentially to avoid macOS/MPS
+    concurrency-related crashes.
+
 Tiled detection: splits each frame into overlapping tiles and merges
 results with global NMS. This catches small/distant bikes that a single
 640px pass misses entirely.
@@ -10,10 +14,9 @@ results with global NMS. This catches small/distant bikes that a single
 
 import os
 from datetime import datetime
-
 import cv2
 
-from inference.models import vehicle_model, helmet_model, plate_model
+from inference.models import MODEL_DEVICE, vehicle_model, helmet_model, plate_model
 from inference.tracker import VehicleTracker
 from utils.ocr import read_plate
 
@@ -27,11 +30,11 @@ BLUE  = (255, 100, 0)
 WHITE = (255, 255, 255)
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
-MIN_AREA_RATIO   = 0.0008  # 0.08% — catches small distant bikes in wide shots
-MIN_VEHICLE_CONF = 0.20    # low threshold; NMS cleans false positives
-NMS_IOU_THRESH   = 0.35    # global NMS across tiles — tighter for dense traffic
-PROCESS_INTERVAL = 3       # run detection every N frames
-TILE_OVERLAP     = 0.25    # 25% overlap between tiles
+MIN_AREA_RATIO   = 0.0008
+MIN_VEHICLE_CONF = 0.20
+NMS_IOU_THRESH   = 0.35
+PROCESS_INTERVAL = 3
+TILE_OVERLAP     = 0.25
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ocr_cache: list = []
@@ -88,10 +91,6 @@ def _iou(a, b):
 
 
 def _global_nms(boxes_confs, iou_thresh=NMS_IOU_THRESH):
-    """
-    boxes_confs: list of (x1,y1,x2,y2,conf)
-    Returns filtered list after NMS.
-    """
     if not boxes_confs:
         return []
     boxes_confs = sorted(boxes_confs, key=lambda x: x[4], reverse=True)
@@ -112,18 +111,15 @@ def _detect_vehicles_tiled(frame, conf_thresh):
     """
     Run vehicle detection on the full frame + a 2x2 tile grid.
     Merge all boxes with global NMS.
-    Returns list of dicts: {box, conf}
     """
     fh, fw = frame.shape[:2]
     all_boxes = []
 
-    # Pass 1: full frame at 1280px for global context
-    res_full = vehicle_model(frame, conf=conf_thresh, classes=TWO_WHEELER_CLASSES, imgsz=1280, device="mps")[0]
+    res_full = vehicle_model(frame, conf=conf_thresh, classes=TWO_WHEELER_CLASSES, imgsz=1280, device=MODEL_DEVICE)[0]
     for vb in res_full.boxes:
         x1, y1, x2, y2 = map(int, vb.xyxy[0])
         all_boxes.append((x1, y1, x2, y2, float(vb.conf[0])))
 
-    # Pass 2: 2x2 tiles with overlap for small/distant vehicles
     step_x = int(fw * (1 - TILE_OVERLAP) / 2)
     step_y = int(fh * (1 - TILE_OVERLAP) / 2)
     tile_w  = fw - step_x
@@ -138,17 +134,15 @@ def _detect_vehicles_tiled(frame, conf_thresh):
             tile = frame[ty1:ty2, tx1:tx2]
             if tile.size == 0:
                 continue
-            res_tile = vehicle_model(tile, conf=conf_thresh, classes=TWO_WHEELER_CLASSES, imgsz=640, device="mps")[0]
+            res_tile = vehicle_model(tile, conf=conf_thresh, classes=TWO_WHEELER_CLASSES, imgsz=640, device=MODEL_DEVICE)[0]
             for vb in res_tile.boxes:
                 bx1, by1, bx2, by2 = map(int, vb.xyxy[0])
-                # Translate back to full-frame coords
                 all_boxes.append((
                     bx1 + tx1, by1 + ty1,
                     bx2 + tx1, by2 + ty1,
                     float(vb.conf[0])
                 ))
 
-    # Global NMS to remove duplicates across tiles
     kept = _global_nms(all_boxes)
     return [{"box": (b[0], b[1], b[2], b[3]), "conf": b[4]} for b in kept]
 
@@ -156,21 +150,19 @@ def _detect_vehicles_tiled(frame, conf_thresh):
 def _detect_helmets_tiled(frame, conf_thresh):
     """
     Run helmet detection on full frame + tiles.
-    Returns list of (hx1, hy1, hx2, hy2, label, conf).
+    Returns list of (hx1, hy1, hx2, hy2, conf, label).
     """
     fh, fw = frame.shape[:2]
     all_helmets = []
     names = None
 
-    # Full frame
-    res_full = helmet_model(frame, conf=conf_thresh, imgsz=1280, device="mps")[0]
+    res_full = helmet_model(frame, conf=conf_thresh, imgsz=1280, device=MODEL_DEVICE)[0]
     names = res_full.names
     for hb in res_full.boxes:
         x1, y1, x2, y2 = map(int, hb.xyxy[0])
         all_helmets.append((x1, y1, x2, y2, float(hb.conf[0]),
                             names[int(hb.cls[0])].lower()))
 
-    # 2x2 tiles
     step_x = int(fw * (1 - TILE_OVERLAP) / 2)
     step_y = int(fh * (1 - TILE_OVERLAP) / 2)
     tile_w  = fw - step_x
@@ -185,7 +177,7 @@ def _detect_helmets_tiled(frame, conf_thresh):
             tile = frame[ty1:ty2, tx1:tx2]
             if tile.size == 0:
                 continue
-            res_tile = helmet_model(tile, conf=conf_thresh, imgsz=640, device="mps")[0]
+            res_tile = helmet_model(tile, conf=conf_thresh, imgsz=640, device=MODEL_DEVICE)[0]
             tn = res_tile.names
             for hb in res_tile.boxes:
                 bx1, by1, bx2, by2 = map(int, hb.xyxy[0])
@@ -196,8 +188,7 @@ def _detect_helmets_tiled(frame, conf_thresh):
                     tn[int(hb.cls[0])].lower()
                 ))
 
-    # NMS on helmets too
-    helm_bc = [(h[0], h[1], h[2], h[3], h[4]) for h in all_helmets]
+    helm_bc  = [(h[0], h[1], h[2], h[3], h[4]) for h in all_helmets]
     kept_bc  = _global_nms(helm_bc)
     kept_set = {(b[0], b[1], b[2], b[3]) for b in kept_bc}
 
@@ -210,6 +201,16 @@ def _detect_helmets_tiled(frame, conf_thresh):
             deduped.append(h)
 
     return deduped, names
+
+
+def _detect_both_tiled(frame, conf_thresh):
+    """
+    Run vehicle and helmet tiled detection sequentially for stability.
+    Returns (vehicle_dets, helm_dets, names).
+    """
+    raw_dets = _detect_vehicles_tiled(frame, conf_thresh)
+    helm_dets, names = _detect_helmets_tiled(frame, conf_thresh)
+    return raw_dets, helm_dets, names
 
 
 def _helmet_distance(h_box, v_box):
@@ -226,7 +227,7 @@ def _helmet_distance(h_box, v_box):
 def _best_plate_in_crop(crop):
     if crop is None or crop.size == 0:
         return None
-    results = plate_model(crop, conf=0.01, device="mps")[0]
+    results = plate_model(crop, conf=0.01, device=MODEL_DEVICE)[0]
     if not results.boxes:
         return None
     best_conf, best_box = -1, None
@@ -243,7 +244,6 @@ def _best_plate_in_crop(crop):
 
 
 def _draw_label(img, text: str, x1: int, y1: int, color, box_h: int = 80):
-    # Scale font with box height — small distant bikes get smaller labels
     scale = max(0.30, min(0.55, box_h / 150.0))
     thick = 1
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
@@ -293,9 +293,8 @@ def process_video(ip: str, op: str, conf: float, progress_callback=None):
             cached_vehicles = []
             cached_plates   = []
 
-            # ── Tiled detection ───────────────────────────────────────────
-            raw_dets   = _detect_vehicles_tiled(frame, MIN_VEHICLE_CONF)
-            helm_dets, names = _detect_helmets_tiled(frame, conf)
+            # ── Tiled detection — vehicle + helmet IN PARALLEL ────────────────
+            raw_dets, helm_dets, names = _detect_both_tiled(frame, conf)
 
             if rider_class_exists is None and names:
                 rider_class_exists = any(
@@ -356,10 +355,6 @@ def process_video(ip: str, op: str, conf: float, progress_callback=None):
                 color = RED if best_v["violation"] else GREEN
                 txt   = f"{label.replace('_', ' ').title()}: {h_conf:.2f}"
                 cached_helmets.append((hx1, hy1, hx2, hy2, color, txt))
-
-            # Note: only flag violation when model explicitly detects "nohelmet"
-            # Do NOT flag vehicles with no helmet detection as violations —
-            # the helmet model misses many helmeted riders on overhead footage.
 
             # Feed into tracker
             dets = [{"box": v["box"], "violation": v["violation"], "plate": v["plate"]}
