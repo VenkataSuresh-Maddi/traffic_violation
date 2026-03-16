@@ -1,6 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════
    TRAFFIC VIOLATION DETECTION — Frontend Logic
-   Confidence is fixed at 0.25 server-side; no slider needed.
    ═══════════════════════════════════════════════════════════════════ */
 
 document.addEventListener("DOMContentLoaded", function () {
