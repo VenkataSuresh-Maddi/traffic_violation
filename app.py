@@ -1,3 +1,4 @@
+```python
 import os
 import warnings
 warnings.filterwarnings("ignore", message="'pin_memory' argument is set as true")
@@ -6,6 +7,20 @@ warnings.filterwarnings("ignore", message="'pin_memory' argument is set as true"
 os.environ.setdefault("TV_FORCE_CPU", "0")
 # Prefer GPU for OCR when available; utils/ocr.py will fallback if unsupported.
 os.environ.setdefault("TV_OCR_GPU", "1")
+
+# 🔥 ADD THIS (MODEL DOWNLOAD)
+import gdown
+
+def download_model(url, path):
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        print(f"Downloading {path}...")
+        gdown.download(url, path, quiet=False)
+
+# Download models (only if not present)
+download_model("https://drive.google.com/uc?id=1iFOU9kThOO2SD1PB8cy1m53l1Jm4wDOr", "models/best.pt")
+download_model("https://drive.google.com/uc?id=1HlaGkpKXHgtY7sM_9uK0bHWexwTPp5b_", "models/plate_best.pt")
+download_model("https://drive.google.com/uc?id=1vmYC9lsz_jzxEUR5AJi0j82HNxXyArec", "models/yolov8n.pt")
 
 from flask import Flask, request, jsonify, Response, send_file, render_template
 from inference.image_infer import process_image
@@ -142,3 +157,4 @@ def serve_output_image(f):
 # -------- RUN SERVER --------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=7860, debug=False, threaded=True)
+```
