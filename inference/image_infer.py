@@ -1,41 +1,38 @@
 """
 Image inference for traffic violation detection.
+Detects no-helmet violations, extracts license plates via OCR,
+logs violations, and saves evidence.
 
-Stability update:
-- Model calls run sequentially to avoid macOS/MPS concurrency crashes.
-
-Active fixes (no pillion logic):
-- NMS_IOU_THRESH = 0.55  (side-by-side bikes not suppressed)
-- MIN_VEHICLE_CONF = 0.15 (catches partial/edge bikes)
-- MIN_AREA_RATIO = 0.005  (wider catch for small bikes)
-- Plate crop 12% padding  (state code like 'KA' not cut off)
-- LARGE_VEHICLE_AREA = 3% (no-helmet fallback for very close bikes)
-- SAFE_HELMET_CONF = 0.25 (minimum conf to accept a helmet label)
+Logic:
+- Vehicle detected + helmet detected nearby     → check label → safe or violation
+- Vehicle detected + NO helmet detected nearby  → VIOLATION (rider has no helmet)
+- Vehicle too small (< 3% image area)           → skip (background noise)
+- Overlapping vehicle boxes (IoU > 0.45)        → NMS keeps only the best one
 """
 
 import os
 from datetime import datetime
+
 import cv2
 
-from inference.models import MODEL_DEVICE, vehicle_model, helmet_model, plate_model
+from inference.models import vehicle_model, helmet_model, plate_model
 from utils.ocr import read_plate
 
 TWO_WHEELER_CLASSES = [3]
 
 VIOLATIONS_DIR = "outputs/violations"
 VIOLATIONS_CSV = "outputs/violations.csv"
-RED   = (0,   0,   255)
-GREEN = (0,   200, 80)
-CYAN  = (0,   220, 220)
+RED   = (0, 0, 255)
+GREEN = (0, 200, 80)
+CYAN  = (0, 220, 220)
 BLUE  = (255, 100, 0)
 WHITE = (255, 255, 255)
 
-MIN_AREA_RATIO   = 0.005
-MIN_VEHICLE_CONF = 0.15
-NMS_IOU_THRESH   = 0.55
-INFER_SIZE       = 1280
-PLATE_CROP_PAD   = 0.12
-SAFE_HELMET_CONF = 0.25
+# ── Tuning ────────────────────────────────────────────────────────────────────
+MIN_AREA_RATIO   = 0.03   # vehicle box must be >= 3% of image area
+MIN_VEHICLE_CONF = 0.35   # minimum YOLO confidence for a vehicle detection
+NMS_IOU_THRESH   = 0.45   # suppress overlapping vehicle boxes above this IoU
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _ensure_output():
@@ -73,10 +70,12 @@ def _iou(a, b):
 
 
 def _nms_vehicles(vehicles):
+    """Keep highest-confidence box when two boxes overlap significantly."""
     if not vehicles:
         return []
     vehicles = sorted(vehicles, key=lambda v: v["conf"], reverse=True)
-    kept, suppressed = [], set()
+    kept = []
+    suppressed = set()
     for i, vi in enumerate(vehicles):
         if i in suppressed:
             continue
@@ -90,24 +89,26 @@ def _nms_vehicles(vehicles):
 
 
 def _helmet_distance(h_box, v_box):
+    """
+    Spatial proximity between a helmet box and a vehicle box.
+    Returns (x_dist, y_dist) where y_dist is the gap ABOVE the vehicle top.
+    """
     h_cx = (h_box[0] + h_box[2]) / 2.0
     v_cx = (v_box[0] + v_box[2]) / 2.0
     x_dist = abs(h_cx - v_cx)
-    v_upper_limit = v_box[1] + (v_box[3] - v_box[1]) * 0.55
-    y_dist = max(0.0, v_box[1] - h_box[3])
-    h_cy = (h_box[1] + h_box[3]) / 2.0
-    if h_cy > v_upper_limit:
-        y_dist += (h_cy - v_upper_limit)
-    v_top_zone = v_box[1] + (v_box[3] - v_box[1]) * 0.35
+    # Allow helmet to be anywhere above OR overlapping the vehicle top quarter
+    v_top_zone = v_box[1] + (v_box[3] - v_box[1]) * 0.4
+    y_dist = max(0.0, v_box[1] - h_box[3])   # gap between helmet bottom and vehicle top
+    # If helmet overlaps the top portion of the vehicle, treat y_dist as 0
     if h_box[3] >= v_box[1] and h_box[1] <= v_top_zone:
         y_dist = 0.0
     return x_dist, y_dist
 
 
-def _best_plate_in_crop(vehicle_crop, vx1, vy1, vx2, vy2):
-    if vehicle_crop is None or vehicle_crop.size == 0:
+def _best_plate_in_crop(crop):
+    if crop is None or crop.size == 0:
         return None
-    results = plate_model(vehicle_crop, conf=0.01, device=MODEL_DEVICE)[0]
+    results = plate_model(crop, conf=0.01, device="mps")[0]
     if not results.boxes:
         return None
     best_conf, best_box = -1, None
@@ -119,104 +120,91 @@ def _best_plate_in_crop(vehicle_crop, vx1, vy1, vx2, vy2):
     if best_box is None:
         return None
     px1, py1, px2, py2 = map(int, best_box.xyxy[0])
-    ph, pw = py2 - py1, px2 - px1
-    pad_x = int(pw * PLATE_CROP_PAD)
-    pad_y = int(ph * PLATE_CROP_PAD)
-    ch, cw = vehicle_crop.shape[:2]
-    px1p = max(0, px1 - pad_x)
-    py1p = max(0, py1 - pad_y)
-    px2p = min(cw, px2 + pad_x)
-    py2p = min(ch, py2 + pad_y)
-    plate_crop = vehicle_crop[py1p:py2p, px1p:px2p]
+    plate_crop = crop[py1:py2, px1:px2]
     return (plate_crop, (px1, py1, px2, py2)) if plate_crop.size else None
 
 
-def _draw_label(img, text: str, x1: int, y1: int, color, box_h: int = 80):
-    scale = max(0.35, min(0.65, box_h / 130.0))
-    thick = 2 if scale > 0.5 else 1
-    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
-    cv2.rectangle(img, (x1, y1 - th - 6), (x1 + tw + 6, y1), color, -1)
-    cv2.putText(img, text, (x1 + 3, y1 - 3),
-                cv2.FONT_HERSHEY_SIMPLEX, scale, WHITE, thick, cv2.LINE_AA)
+def _draw_label(img, text: str, x1: int, y1: int, color):
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+    cv2.rectangle(img, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
+    cv2.putText(img, text, (x1 + 3, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, WHITE, 2, cv2.LINE_AA)
 
 
 def process_image(input_path: str, output_path: str, conf: float):
+    """
+    Process a single image for helmet-violation detection.
+    Returns (total_violations, plate_number_found, stats_dict)
+    """
     image = cv2.imread(input_path)
     if image is None:
         return 0, None, {"total": 0, "violations": 0, "safe": 0}
 
     out    = image.copy()
     ih, iw = image.shape[:2]
-    frame_area = iw * ih
-    min_area   = frame_area * MIN_AREA_RATIO
+    min_area = iw * ih * MIN_AREA_RATIO
     _ensure_output()
 
-    # Use sequential model calls for stability on macOS/MPS.
-    vehicle_res = vehicle_model(
-        image, conf=MIN_VEHICLE_CONF,
-        classes=TWO_WHEELER_CLASSES,
-        imgsz=INFER_SIZE, device=MODEL_DEVICE
-    )[0]
+    # ── 1. Detect vehicles ───────────────────────────────────────────────────
+    vehicle_res = vehicle_model(image, conf=max(conf, MIN_VEHICLE_CONF), classes=TWO_WHEELER_CLASSES, device="mps")[0]
 
-    helmet_res = helmet_model(
-        image, conf=0.10,
-        imgsz=INFER_SIZE, device=MODEL_DEVICE
-    )[0]
-
-    # ── 2. Build vehicle list ────────────────────────────────────────────────
     raw_vehicles = []
     for vb in vehicle_res.boxes:
         x1, y1, x2, y2 = map(int, vb.xyxy[0])
         vconf = float(vb.conf[0])
-        if (x2 - x1) * (y2 - y1) < min_area:
+        area  = (x2 - x1) * (y2 - y1)
+        if area < min_area:
+            continue
+        if vconf < MIN_VEHICLE_CONF:
             continue
         raw_vehicles.append({
             "box":            (x1, y1, x2, y2),
             "conf":           vconf,
             "violation":      False,
-            "has_any_helmet": False,
+            "has_any_helmet": False,   # True if ANY helmet label matched this vehicle
             "plate":          "",
             "plate_box":      None,
         })
 
+    # NMS: remove duplicate boxes for the same physical vehicle
     vehicles = _nms_vehicles(raw_vehicles)
 
-    # ── 3. Match helmets → vehicles ──────────────────────────────────────────
-    names = helmet_res.names
+    # ── 2. Detect helmets ────────────────────────────────────────────────────
+    helmet_res = helmet_model(image, conf=conf, device="mps")[0]
+    names      = helmet_res.names
     rider_class_exists = any("rider" in names[i].lower() for i in range(len(names)))
 
+    # ── 3. Match each helmet detection to its nearest vehicle ─────────────────
     for hb in helmet_res.boxes:
         hx1, hy1, hx2, hy2 = map(int, hb.xyxy[0])
         h_box  = (hx1, hy1, hx2, hy2)
         label  = names[int(hb.cls[0])].lower()
         h_conf = float(hb.conf[0])
 
-        best_v, best_score = None, float("inf")
+        best_v, best_dist = None, float("inf")
         for v in vehicles:
             vx1, vy1, vx2, vy2 = v["box"]
             vw = vx2 - vx1
             vh = vy2 - vy1
-            if vw == 0 or vh == 0:
-                continue
             xd, yd = _helmet_distance(h_box, v["box"])
-            norm_xd = xd / vw
-            norm_yd = yd / vh
-            if norm_xd < 0.50 and norm_yd < 0.60:
-                score = norm_xd + norm_yd
-                if score < best_score:
-                    best_score = score
-                    best_v     = v
+            # Helmet centre must be within 70% of vehicle width horizontally
+            # and within 80% of vehicle height vertically above it
+            if xd < vw * 0.70 and yd < vh * 0.80:
+                d = xd + yd
+                if d < best_dist:
+                    best_dist = d
+                    best_v    = v
 
         if best_v is None:
             continue
 
-        if "no" not in label and h_conf < SAFE_HELMET_CONF:
-            continue
-
+        # Mark that this vehicle has at least one helmet detection near it
         best_v["has_any_helmet"] = True
 
+        # Determine violation
         if "no" in label and "helmet" in label:
             if rider_class_exists:
+                # Only flag if a rider class is also near this vehicle
                 for hb2 in helmet_res.boxes:
                     lbl2 = names[int(hb2.cls[0])].lower()
                     if "rider" not in lbl2:
@@ -231,22 +219,15 @@ def process_image(input_path: str, output_path: str, conf: float):
             else:
                 best_v["violation"] = True
 
+        # Draw helmet box
         color = RED if best_v["violation"] else GREEN
         txt   = f"{label.replace('_', ' ').title()}: {h_conf:.2f}"
-        vx1, vy1, vx2, vy2 = best_v["box"]
         cv2.rectangle(out, (hx1, hy1), (hx2, hy2), color, 2)
-        _draw_label(out, txt, hx1, hy1, color, vy2 - vy1)
+        _draw_label(out, txt, hx1, hy1, color)
 
-    # ── 4. Large-vehicle no-helmet fallback ──────────────────────────────────
-    LARGE_VEHICLE_AREA = frame_area * 0.030
-    for v in vehicles:
-        if v["violation"]:
-            continue
-        if not v["has_any_helmet"]:
-            vx1, vy1, vx2, vy2 = v["box"]
-            area = (vx2 - vx1) * (vy2 - vy1)
-            if area >= LARGE_VEHICLE_AREA:
-                v["violation"] = True
+    # Only flag violation when model explicitly detects "nohelmet" label.
+    # Do NOT assume vehicles with no helmet detection are violating —
+    # the helmet model misses many helmeted riders especially at distance.
 
     # ── 5. Plate detection, OCR, evidence saving ─────────────────────────────
     plate_found  = None
@@ -254,11 +235,10 @@ def process_image(input_path: str, output_path: str, conf: float):
 
     for v in vehicles:
         vx1, vy1, vx2, vy2 = v["box"]
-        box_h = vy2 - vy1
-        crop  = image[vy1:vy2, vx1:vx2]
+        crop = image[vy1:vy2, vx1:vx2]
 
         if v["violation"]:
-            res = _best_plate_in_crop(crop, vx1, vy1, vx2, vy2)
+            res = _best_plate_in_crop(crop)
             plate_num = ""
             if res:
                 plate_crop, (px1, py1, px2, py2) = res
@@ -273,18 +253,18 @@ def process_image(input_path: str, output_path: str, conf: float):
             ev_path = _save_evidence(crop, ts_str)
             _log_violation(plate_num or "UNKNOWN", 0, ev_path)
 
-            cv2.rectangle(out, (vx1, vy1), (vx2, vy2), RED, 2)
+            cv2.rectangle(out, (vx1, vy1), (vx2, vy2), RED, 3)
             lbl = f"VIOLATION | Plate: {plate_num if plate_num else 'N/A'}"
-            _draw_label(out, lbl, vx1, vy1, RED, box_h)
+            _draw_label(out, lbl, vx1, vy1, RED)
 
             if v["plate_box"]:
                 px1, py1, px2, py2 = v["plate_box"]
                 cv2.rectangle(out, (px1, py1), (px2, py2), BLUE, 2)
         else:
             cv2.rectangle(out, (vx1, vy1), (vx2, vy2), CYAN, 2)
-            _draw_label(out, "Two-Wheeler", vx1, vy1, (0, 140, 140), box_h)
+            _draw_label(out, "Two-Wheeler ✓", vx1, vy1, (0, 140, 140))
 
-    # ── 6. Stats + HUD ───────────────────────────────────────────────────────
+    # ── 6. Stats + HUD overlay ───────────────────────────────────────────────
     stats = {
         "total":      len(vehicles),
         "violations": sum(1 for v in vehicles if v["violation"]),
