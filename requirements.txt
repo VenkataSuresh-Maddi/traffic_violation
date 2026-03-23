@@ -5,7 +5,7 @@ ultralytics
 opencv-python-headless
 numpy
 easyocr
-torch==2.2.2
-torchvision==0.17.2
+torch
+torchvision
 pillow
 scipy
