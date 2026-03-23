@@ -1,4 +1,3 @@
-```python
 import os
 import warnings
 warnings.filterwarnings("ignore", message="'pin_memory' argument is set as true")
