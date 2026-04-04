@@ -155,11 +155,62 @@ async def stop_webcam():
     return JSONResponse({}, status_code=204)
 
 
+# ── Violations Dashboard ──────────────────────────────────────────────────────
+
+@app.get("/violations_page", response_class=HTMLResponse)
+async def violations_page():
+    with open("templates/violations.html", "r", encoding="utf-8") as f:
+        html = f.read()
+    return HTMLResponse(content=html)
+
+
+@app.get("/api/violations")
+async def get_violations():
+    """Get all violations from CSV as JSON"""
+    violations_csv = "outputs/violations.csv"
+    
+    if not os.path.exists(violations_csv):
+        return JSONResponse({"violations": []})
+    
+    violations = []
+    try:
+        with open(violations_csv, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        # Skip header
+        for line in lines[1:]:
+            parts = line.strip().split(",")
+            if len(parts) >= 4:
+                timestamp, plate, frame, image_path = parts[0], parts[1], parts[2], parts[3]
+                # Skip empty rows
+                if not timestamp or not timestamp.strip():
+                    continue
+                violations.append({
+                    "timestamp": timestamp,
+                    "plate_number": plate,
+                    "frame_number": frame,
+                    "image_path": image_path,
+                    "image_url": f"/{image_path}" if image_path else None
+                })
+    except Exception as e:
+        print(f"Error reading violations: {e}")
+    
+    return JSONResponse({"violations": violations})
+
+
 # ── Static file serving ───────────────────────────────────────────────────────
 
 @app.get("/uploads/{filename:path}")
 async def serve_upload(filename: str):
     path = os.path.join(UPLOAD, filename)
+    if not os.path.exists(path):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return FileResponse(path)
+
+
+@app.get("/outputs/{filepath:path}")
+async def serve_outputs(filepath: str):
+    path = os.path.join("outputs", filepath)
     if not os.path.exists(path):
         return JSONResponse({"error": "Not found"}, status_code=404)
     return FileResponse(path)
