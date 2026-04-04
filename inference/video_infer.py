@@ -3,14 +3,11 @@ Video inference for traffic violation detection.
 Uses tiled detection + VehicleTracker to count every unique vehicle
 exactly once across all frames — no double counting.
 
-Tiled detection: splits each frame into overlapping tiles and merges
-results with global NMS. This catches small/distant bikes that a single
-640px pass misses entirely.
-
-Thread-safety: process_video is designed to be called from a thread pool
-(via asyncio.run_in_executor). The progress_callback writes to a shared
-dict; reads from the event loop are safe because GIL protects simple dict
-writes and the values are plain ints.
+Person+Motorcycle merging:
+- Detects both persons (class 0) and motorcycles (class 3)
+- Pairs each person with their nearest motorcycle using IoU/proximity
+- Merges the two boxes so the final bounding box covers rider + bike
+- This ensures the violation crop always contains the full rider
 """
 
 import os
@@ -22,22 +19,30 @@ from inference.models import vehicle_model, helmet_model, plate_model
 from inference.tracker import VehicleTracker
 from utils.ocr import read_plate
 
-TWO_WHEELER_CLASSES = [3]
+MOTORCYCLE_CLASS = [3]
+PERSON_CLASS     = [0]
+
 VIOLATIONS_DIR = "outputs/violations"
 VIOLATIONS_CSV = "outputs/violations.csv"
 RED   = (0, 0, 255)
 GREEN = (0, 200, 80)
 CYAN  = (0, 220, 220)
 BLUE  = (255, 100, 0)
+YELLOW = (0, 215, 255)
 WHITE = (255, 255, 255)
 
-# ── Tuning ────────────────────────────────────────────────────────────────────
-MIN_AREA_RATIO   = 0.0008  # 0.08% — catches small distant bikes in wide shots
-MIN_VEHICLE_CONF = 0.20    # low threshold; NMS cleans false positives
-NMS_IOU_THRESH   = 0.35    # global NMS across tiles — tighter for dense traffic
-PROCESS_INTERVAL = 3       # run detection every N frames
-TILE_OVERLAP     = 0.25    # 25% overlap between tiles
-# ─────────────────────────────────────────────────────────────────────────────
+MIN_AREA_RATIO   = 0.0008
+MIN_VEHICLE_CONF = 0.20
+MIN_PERSON_CONF  = 0.25
+NMS_IOU_THRESH   = 0.35
+PROCESS_INTERVAL = 3
+TILE_OVERLAP     = 0.25
+
+# Max horizontal distance between person centre and bike centre
+# as a fraction of bike width, to count as "on this bike"
+PERSON_BIKE_X_RATIO = 1.2
+# Person box bottom must be within this fraction of bike height above bike top
+PERSON_BIKE_Y_RATIO = 1.5
 
 _ocr_cache: list = []
 _OCR_CACHE_MAX_AGE     = 45
@@ -109,11 +114,18 @@ def _global_nms(boxes_confs, iou_thresh=NMS_IOU_THRESH):
     return kept
 
 
-def _detect_vehicles_tiled(frame, conf_thresh):
+def _merge_box(a, b):
+    """Return the bounding box that encompasses both boxes a and b."""
+    return (min(a[0], b[0]), min(a[1], b[1]),
+            max(a[2], b[2]), max(a[3], b[3]))
+
+
+def _detect_tiled(frame, conf_thresh, classes, imgsz_full=1280, imgsz_tile=640):
+    """Generic tiled detection for any class list. Returns list of (x1,y1,x2,y2,conf)."""
     fh, fw = frame.shape[:2]
     all_boxes = []
 
-    res_full = vehicle_model(frame, conf=conf_thresh, classes=TWO_WHEELER_CLASSES, imgsz=1280, device="mps")[0]
+    res_full = vehicle_model(frame, conf=conf_thresh, classes=classes, imgsz=imgsz_full, device="mps")[0]
     for vb in res_full.boxes:
         x1, y1, x2, y2 = map(int, vb.xyxy[0])
         all_boxes.append((x1, y1, x2, y2, float(vb.conf[0])))
@@ -125,24 +137,67 @@ def _detect_vehicles_tiled(frame, conf_thresh):
 
     for row in range(2):
         for col in range(2):
-            tx1 = col * step_x
-            ty1 = row * step_y
-            tx2 = min(tx1 + tile_w, fw)
-            ty2 = min(ty1 + tile_h, fh)
+            tx1 = col * step_x; ty1 = row * step_y
+            tx2 = min(tx1 + tile_w, fw); ty2 = min(ty1 + tile_h, fh)
             tile = frame[ty1:ty2, tx1:tx2]
             if tile.size == 0:
                 continue
-            res_tile = vehicle_model(tile, conf=conf_thresh, classes=TWO_WHEELER_CLASSES, imgsz=640, device="mps")[0]
+            res_tile = vehicle_model(tile, conf=conf_thresh, classes=classes, imgsz=imgsz_tile, device="mps")[0]
             for vb in res_tile.boxes:
                 bx1, by1, bx2, by2 = map(int, vb.xyxy[0])
-                all_boxes.append((
-                    bx1 + tx1, by1 + ty1,
-                    bx2 + tx1, by2 + ty1,
-                    float(vb.conf[0])
-                ))
+                all_boxes.append((bx1+tx1, by1+ty1, bx2+tx1, by2+ty1, float(vb.conf[0])))
 
-    kept = _global_nms(all_boxes)
-    return [{"box": (b[0], b[1], b[2], b[3]), "conf": b[4]} for b in kept]
+    return _global_nms(all_boxes)
+
+
+def _pair_persons_to_bikes(bike_boxes, person_boxes):
+    """
+    For each detected person, find the nearest motorcycle and merge their boxes.
+    Returns updated bike_boxes with merged (rider+bike) bounding boxes,
+    plus list of person boxes that were successfully paired (for drawing).
+    """
+    paired_persons = []   # (person_box, bike_index)
+    used_persons   = set()
+
+    for bi, bike in enumerate(bike_boxes):
+        bx1, by1, bx2, by2 = bike["box"]
+        bw = bx2 - bx1
+        bh = by2 - by1
+        b_cx = (bx1 + bx2) / 2.0
+
+        best_pi, best_score = None, float("inf")
+        for pi, pb in enumerate(person_boxes):
+            if pi in used_persons:
+                continue
+            px1, py1, px2, py2 = pb["box"]
+            p_cx = (px1 + px2) / 2.0
+            p_cy = (py1 + py2) / 2.0
+
+            x_dist = abs(p_cx - b_cx)
+            # Person must be horizontally close to bike
+            if x_dist > bw * PERSON_BIKE_X_RATIO:
+                continue
+            # Person bottom must be near or overlapping bike top
+            # (handles overhead/side camera angles)
+            y_gap = py1 - by2   # positive = person is above bike
+            if y_gap > bh * PERSON_BIKE_Y_RATIO:
+                continue
+            # Prefer person whose bottom is closest to bike top
+            score = x_dist + abs(py2 - by1)
+            if score < best_score:
+                best_score = score
+                best_pi    = pi
+
+        if best_pi is not None:
+            pb = person_boxes[best_pi]
+            # Merge: expand bike box to include person
+            merged = _merge_box(bike["box"], pb["box"])
+            bike["box"]         = merged
+            bike["person_box"]  = pb["box"]
+            used_persons.add(best_pi)
+            paired_persons.append((pb["box"], bi))
+
+    return bike_boxes, paired_persons
 
 
 def _detect_helmets_tiled(frame, conf_thresh):
@@ -164,10 +219,8 @@ def _detect_helmets_tiled(frame, conf_thresh):
 
     for row in range(2):
         for col in range(2):
-            tx1 = col * step_x
-            ty1 = row * step_y
-            tx2 = min(tx1 + tile_w, fw)
-            ty2 = min(ty1 + tile_h, fh)
+            tx1 = col * step_x; ty1 = row * step_y
+            tx2 = min(tx1 + tile_w, fw); ty2 = min(ty1 + tile_h, fh)
             tile = frame[ty1:ty2, tx1:tx2]
             if tile.size == 0:
                 continue
@@ -175,25 +228,17 @@ def _detect_helmets_tiled(frame, conf_thresh):
             tn = res_tile.names
             for hb in res_tile.boxes:
                 bx1, by1, bx2, by2 = map(int, hb.xyxy[0])
-                all_helmets.append((
-                    bx1 + tx1, by1 + ty1,
-                    bx2 + tx1, by2 + ty1,
-                    float(hb.conf[0]),
-                    tn[int(hb.cls[0])].lower()
-                ))
+                all_helmets.append((bx1+tx1, by1+ty1, bx2+tx1, by2+ty1,
+                                    float(hb.conf[0]), tn[int(hb.cls[0])].lower()))
 
     helm_bc  = [(h[0], h[1], h[2], h[3], h[4]) for h in all_helmets]
     kept_bc  = _global_nms(helm_bc)
     kept_set = {(b[0], b[1], b[2], b[3]) for b in kept_bc}
-
-    deduped = []
-    seen = set()
+    deduped, seen = [], set()
     for h in all_helmets:
         key = (h[0], h[1], h[2], h[3])
         if key in kept_set and key not in seen:
-            seen.add(key)
-            deduped.append(h)
-
+            seen.add(key); deduped.append(h)
     return deduped, names
 
 
@@ -218,8 +263,7 @@ def _best_plate_in_crop(crop):
     for pb in results.boxes:
         c = float(pb.conf[0])
         if c > best_conf:
-            best_conf = c
-            best_box  = pb
+            best_conf = c; best_box = pb
     if best_box is None:
         return None
     px1, py1, px2, py2 = map(int, best_box.xyxy[0])
@@ -237,10 +281,6 @@ def _draw_label(img, text: str, x1: int, y1: int, color, box_h: int = 80):
 
 
 def process_video(ip: str, op: str, conf: float, progress_callback=None):
-    """
-    Blocking function — intended to be called from a thread pool via
-    asyncio.run_in_executor so it never blocks the FastAPI event loop.
-    """
     global _ocr_cache
     _ocr_cache = []
 
@@ -261,6 +301,7 @@ def process_video(ip: str, op: str, conf: float, progress_callback=None):
     cached_helmets   = []
     cached_vehicles  = []
     cached_plates    = []
+    cached_persons   = []   # person boxes paired with bikes
     logged_track_ids: set = set()
 
     _ensure_output()
@@ -280,8 +321,38 @@ def process_video(ip: str, op: str, conf: float, progress_callback=None):
             cached_helmets  = []
             cached_vehicles = []
             cached_plates   = []
+            cached_persons  = []
 
-            raw_dets   = _detect_vehicles_tiled(frame, MIN_VEHICLE_CONF)
+            # ── Detect motorcycles ────────────────────────────────────────
+            raw_bike_dets = _detect_tiled(frame, MIN_VEHICLE_CONF, MOTORCYCLE_CLASS)
+            # ── Detect persons ────────────────────────────────────────────
+            raw_person_dets = _detect_tiled(frame, MIN_PERSON_CONF, PERSON_CLASS)
+
+            bike_boxes = []
+            for b in raw_bike_dets:
+                area = (b[2]-b[0]) * (b[3]-b[1])
+                if area < min_area:
+                    continue
+                bike_boxes.append({
+                    "box":        (b[0], b[1], b[2], b[3]),
+                    "conf":       b[4],
+                    "violation":  False,
+                    "has_any_helmet": False,
+                    "plate":      "",
+                    "person_box": None,
+                })
+
+            person_boxes = [{"box": (p[0], p[1], p[2], p[3]), "conf": p[4]}
+                            for p in raw_person_dets]
+
+            # ── Merge persons into bike boxes ─────────────────────────────
+            vehicles, paired_persons = _pair_persons_to_bikes(bike_boxes, person_boxes)
+
+            # Store person boxes for drawing (yellow outline)
+            for pb_box, _ in paired_persons:
+                cached_persons.append(pb_box)
+
+            # ── Detect helmets ────────────────────────────────────────────
             helm_dets, names = _detect_helmets_tiled(frame, conf)
 
             if rider_class_exists is None and names:
@@ -289,20 +360,7 @@ def process_video(ip: str, op: str, conf: float, progress_callback=None):
                     "rider" in names[i].lower() for i in range(len(names))
                 )
 
-            vehicles = []
-            for det in raw_dets:
-                x1, y1, x2, y2 = det["box"]
-                area = (x2 - x1) * (y2 - y1)
-                if area < min_area:
-                    continue
-                vehicles.append({
-                    "box":            (x1, y1, x2, y2),
-                    "conf":           det["conf"],
-                    "violation":      False,
-                    "has_any_helmet": False,
-                    "plate":          "",
-                })
-
+            # ── Match helmets → vehicles ──────────────────────────────────
             for (hx1, hy1, hx2, hy2, h_conf, label) in helm_dets:
                 h_box = (hx1, hy1, hx2, hy2)
 
@@ -314,8 +372,7 @@ def process_video(ip: str, op: str, conf: float, progress_callback=None):
                     if xd < vw * 0.70 and yd < vh * 0.80:
                         d = xd + yd
                         if d < best_d:
-                            best_d = d
-                            best_v = v
+                            best_d = d; best_v = v
 
                 if best_v is None:
                     continue
@@ -329,9 +386,7 @@ def process_video(ip: str, op: str, conf: float, progress_callback=None):
                                 continue
                             vx1, vy1, vx2, vy2 = best_v["box"]
                             vw, vh = vx2 - vx1, vy2 - vy1
-                            rxd, ryd = _helmet_distance(
-                                (rx1, ry1, rx2, ry2), best_v["box"]
-                            )
+                            rxd, ryd = _helmet_distance((rx1, ry1, rx2, ry2), best_v["box"])
                             if rxd < vw * 0.70 and ryd < vh * 0.80:
                                 best_v["violation"] = True
                                 break
@@ -342,6 +397,7 @@ def process_video(ip: str, op: str, conf: float, progress_callback=None):
                 txt   = f"{label.replace('_', ' ').title()}: {h_conf:.2f}"
                 cached_helmets.append((hx1, hy1, hx2, hy2, color, txt))
 
+            # ── Tracker ───────────────────────────────────────────────────
             dets = [{"box": v["box"], "violation": v["violation"], "plate": v["plate"]}
                     for v in vehicles]
             active_tracks = tracker.update(dets)
@@ -389,7 +445,12 @@ def process_video(ip: str, op: str, conf: float, progress_callback=None):
                         ev_path = _save_evidence(crop, ts_str)
                         _log_violation(plate_num or "UNKNOWN", frame_count, ev_path)
 
-        # ── DRAWING ───────────────────────────────────────────────────────────
+        # ── DRAWING ───────────────────────────────────────────────────────
+        # Draw person boxes (yellow) — shows rider detected separately
+        for pb in cached_persons:
+            px1, py1, px2, py2 = pb
+            cv2.rectangle(frame, (px1, py1), (px2, py2), YELLOW, 1)
+
         for hx1, hy1, hx2, hy2, color, txt in cached_helmets:
             cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), color, 1)
             _draw_label(frame, txt, hx1, hy1, color, hy2 - hy1)
@@ -397,7 +458,7 @@ def process_video(ip: str, op: str, conf: float, progress_callback=None):
         for (vx1, vy1, vx2, vy2, is_viol, tid) in cached_vehicles:
             if not is_viol:
                 cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), CYAN, 1)
-                _draw_label(frame, f"#{tid} Safe", vx1, vy1, (0, 140, 140), vy2 - vy1)
+                _draw_label(frame, f"#{tid} Rider+Bike", vx1, vy1, (0, 140, 140), vy2 - vy1)
 
         for item in cached_plates:
             vx1, vy1, vx2, vy2, px1, py1, px2, py2, plate_num, tid = item
