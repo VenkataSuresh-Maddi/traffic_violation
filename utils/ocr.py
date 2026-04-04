@@ -25,10 +25,15 @@ _LETTER_TO_DIGIT = {"O": "0", "I": "1", "L": "1", "S": "5", "B": "8", "Z": "2", 
 
 
 def _get_reader():
-    """Get or create the EasyOCR reader instance."""
+    """Get or create the EasyOCR reader instance.
+    Tries GPU (CUDA/MPS) first; falls back to CPU if unavailable.
+    """
     global _reader
     if _reader is None:
-        _reader = easyocr.Reader(["en"], gpu=False)
+        try:
+            _reader = easyocr.Reader(["en"], gpu=True)
+        except Exception:
+            _reader = easyocr.Reader(["en"], gpu=False)
     return _reader
 
 

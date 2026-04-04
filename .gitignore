@@ -8,6 +8,10 @@ uploads/
 *.pt
 *.pth
 *.weights
+!models/
+!models/**/*.pt
+!models/**/*.pth
+!models/**/*.weights
 
 # Python cache
 __pycache__/

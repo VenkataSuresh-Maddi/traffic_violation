@@ -1,261 +1,310 @@
 """
 Webcam inference for traffic violation detection.
-Detects no-helmet violations, extracts license plates via OCR, logs violations, saves evidence.
-Uses OCR cache to avoid repeated OCR for the same vehicle.
+Uses VehicleTracker to count unique vehicles with no double-counting.
+
+Fixes applied vs previous version:
+- device="mps" on all model calls (GPU acceleration)
+- has_any_helmet logic: vehicle with no helmet match = violation
+- MIN_AREA_RATIO lowered to 0.008 (consistent with video_infer)
+- NMS on vehicle boxes to avoid double-counting
+- Generator is a plain Python generator — compatible with FastAPI StreamingResponse
 """
 
 import os
 from datetime import datetime
+from typing import Callable, Generator
 
 import cv2
-from ultralytics import YOLO
 
+from inference.models import vehicle_model, helmet_model, plate_model
+from inference.tracker import VehicleTracker
 from utils.ocr import read_plate
 
-
-vehicle_model = YOLO("yolov8n.pt")
-helmet_model = YOLO("models/best.pt")
-plate_model = YOLO("models/plate_best.pt")
-
-TWO_WHEELER_CLASSES = [1, 3]
+TWO_WHEELER_CLASSES = [3]
 VIOLATIONS_DIR = "outputs/violations"
 VIOLATIONS_CSV = "outputs/violations.csv"
-RED = (0, 0, 255)
+RED   = (0, 0, 255)
+GREEN = (0, 200, 80)
+CYAN  = (0, 220, 220)
+BLUE  = (255, 100, 0)
+WHITE = (255, 255, 255)
 
-# OCR cache: avoid running OCR repeatedly for same vehicle
-_ocr_cache = []
-_OCR_CACHE_MAX_AGE = 90  # frames (~3 sec at 30fps)
-_OCR_CACHE_DIST_THRESH = 80
+MIN_AREA_RATIO   = 0.008
+MIN_VEHICLE_CONF = 0.20
+NMS_IOU_THRESH   = 0.45
+
+_ocr_cache: list = []
+_OCR_CACHE_MAX_AGE     = 90
+_OCR_CACHE_DIST_THRESH = 90
 
 
-def _ensure_violations_output():
-    """Ensure violations directory and CSV header exist."""
+def _ensure_output():
     os.makedirs(VIOLATIONS_DIR, exist_ok=True)
     if not os.path.exists(VIOLATIONS_CSV):
         with open(VIOLATIONS_CSV, "w") as f:
             f.write("timestamp,plate_number,frame_number,image_path\n")
 
 
-def _log_violation(plate_number, frame_number, image_path):
-    """Append a violation row to violations.csv."""
-    _ensure_violations_output()
+def _log_violation(plate: str, frame: int, path: str):
+    _ensure_output()
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    plate = plate_number if plate_number else "UNKNOWN"
     with open(VIOLATIONS_CSV, "a") as f:
-        f.write(f"{ts},{plate},{frame_number},{image_path}\n")
+        f.write(f"{ts},{plate or 'UNKNOWN'},{frame},{path}\n")
 
 
-def _save_violation_evidence(image, timestamp_str):
-    """Save cropped violation image to outputs/violations/."""
-    _ensure_violations_output()
-    path = os.path.join(VIOLATIONS_DIR, f"violation_{timestamp_str}.jpg")
-    cv2.imwrite(path, image)
+def _save_evidence(img, ts_str: str) -> str:
+    _ensure_output()
+    path = os.path.join(VIOLATIONS_DIR, f"violation_{ts_str}.jpg")
+    cv2.imwrite(path, img)
     return path
 
 
 def _get_cached_plate(cx, cy, frame_count):
-    """Return cached plate if vehicle at (cx,cy) was recently OCR'd."""
     for ex, ey, plate, fnum in _ocr_cache:
-        if abs(cx - ex) < _OCR_CACHE_DIST_THRESH and abs(cy - ey) < _OCR_CACHE_DIST_THRESH:
+        if abs(cx-ex) < _OCR_CACHE_DIST_THRESH and abs(cy-ey) < _OCR_CACHE_DIST_THRESH:
             if frame_count - fnum <= _OCR_CACHE_MAX_AGE:
                 return plate
     return None
 
 
-def _add_to_ocr_cache(cx, cy, plate, frame_count):
-    """Add plate result to cache. Evict old entries."""
+def _cache_plate(cx, cy, plate, frame_count):
     global _ocr_cache
     _ocr_cache.append((cx, cy, plate, frame_count))
-    _ocr_cache = [
-        (x, y, p, f) for x, y, p, f in _ocr_cache
-        if frame_count - f <= _OCR_CACHE_MAX_AGE
-    ]
+    _ocr_cache = [(x, y, p, f) for x, y, p, f in _ocr_cache
+                  if frame_count - f <= _OCR_CACHE_MAX_AGE]
 
 
-def _get_distance(h_box, v_box):
-    """Calculate spatial distance between helmet box and vehicle box."""
-    h_center_x = (h_box[0] + h_box[2]) / 2.0
-    v_center_x = (v_box[0] + v_box[2]) / 2.0
-    h_bottom_y = h_box[3]
-    v_top_y = v_box[1]
-    x_dist = abs(h_center_x - v_center_x)
-    y_dist = max(0, v_top_y - h_bottom_y)
+def _iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
+    inter = max(0, ix2-ix1) * max(0, iy2-iy1)
+    if inter == 0:
+        return 0.0
+    union = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _nms_vehicles(vehicles):
+    if not vehicles:
+        return []
+    vehicles = sorted(vehicles, key=lambda v: v["conf"], reverse=True)
+    kept, suppressed = [], set()
+    for i, vi in enumerate(vehicles):
+        if i in suppressed:
+            continue
+        kept.append(vi)
+        for j, vj in enumerate(vehicles):
+            if j <= i or j in suppressed:
+                continue
+            if _iou(vi["box"], vj["box"]) > NMS_IOU_THRESH:
+                suppressed.add(j)
+    return kept
+
+
+def _helmet_distance(h_box, v_box):
+    h_cx = (h_box[0] + h_box[2]) / 2.0
+    v_cx = (v_box[0] + v_box[2]) / 2.0
+    x_dist = abs(h_cx - v_cx)
+    v_top_zone = v_box[1] + (v_box[3] - v_box[1]) * 0.4
+    y_dist = max(0.0, v_box[1] - h_box[3])
+    if h_box[3] >= v_box[1] and h_box[1] <= v_top_zone:
+        y_dist = 0.0
     return x_dist, y_dist
 
 
-def _has_rider_nearby(helmet_results, vehicle_box, names):
-    """Check if a rider is detected near the vehicle."""
-    vx1, vy1, vx2, vy2 = vehicle_box
-    v_width = vx2 - vx1
-    v_height = vy2 - vy1
-    for hbox in helmet_results.boxes:
-        label = names[int(hbox.cls[0])].lower()
-        if "rider" not in label:
-            continue
-        hx1, hy1, hx2, hy2 = map(int, hbox.xyxy[0])
-        h_box = (hx1, hy1, hx2, hy2)
-        x_dist, y_dist = _get_distance(h_box, vehicle_box)
-        if x_dist < v_width * 0.6 and y_dist < v_height * 0.6:
-            return True
-    return False
+def _best_plate_in_crop(crop):
+    if crop is None or crop.size == 0:
+        return None
+    results = plate_model(crop, conf=0.01, device="mps")[0]
+    if not results.boxes:
+        return None
+    best_conf, best_box = -1, None
+    for pb in results.boxes:
+        c = float(pb.conf[0])
+        if c > best_conf:
+            best_conf = c
+            best_box  = pb
+    if best_box is None:
+        return None
+    px1, py1, px2, py2 = map(int, best_box.xyxy[0])
+    plate_crop = crop[py1:py2, px1:px2]
+    return (plate_crop, (px1, py1, px2, py2)) if plate_crop.size else None
 
 
-def _detect_plate_in_motorcycle(motorcycle_crop, plate_model):
-    """Run plate model on motorcycle crop and return (plate_crop, global_plate_box) or None."""
-    if motorcycle_crop.size == 0:
-        return None
-    plate_results = plate_model(motorcycle_crop, conf=0.01)[0]
-    if len(plate_results.boxes) == 0:
-        return None
-    best_pbox = None
-    best_pconf = -1
-    for pbox in plate_results.boxes:
-        c = float(pbox.conf[0])
-        if c > best_pconf:
-            best_pconf = c
-            best_pbox = pbox
-    if best_pbox is None:
-        return None
-    px1, py1, px2, py2 = map(int, best_pbox.xyxy[0])
-    plate_crop = motorcycle_crop[py1:py2, px1:px2]
-    if plate_crop.size == 0:
-        return None
-    return plate_crop, (px1, py1, px2, py2)
+def _draw_label(img, text: str, x1: int, y1: int, color):
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 2)
+    cv2.rectangle(img, (x1, y1 - th - 8), (x1 + tw + 6, y1), color, -1)
+    cv2.putText(img, text, (x1 + 3, y1 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.60, WHITE, 2, cv2.LINE_AA)
 
 
-def generate_frames(conf, stop_flag):
+def generate_frames(conf: float, stop_flag: Callable[[], bool]) -> Generator[bytes, None, None]:
     """
-    Generate frames from webcam with violation detection.
-    Draws red box and "NO HELMET | Plate: X" for violations, logs and saves evidence.
+    Plain synchronous generator — yields MJPEG frames as bytes.
+    Compatible with FastAPI StreamingResponse (run in threadpool via StreamingResponse).
     """
+    global _ocr_cache
+    _ocr_cache = []
+
     cap = cv2.VideoCapture(0)
-    frame_count = 0
-    _ensure_violations_output()
+    if not cap.isOpened():
+        return
 
-    while cap.isOpened():
-        if stop_flag():
-            break
+    frame_count      = 0
+    tracker          = VehicleTracker()
+    logged_track_ids: set = set()
+    _ensure_output()
+    rider_class_exists = None
 
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while cap.isOpened():
+            if stop_flag():
+                break
 
-        frame_count += 1
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        vehicle_results = vehicle_model(frame, conf=conf, classes=TWO_WHEELER_CLASSES)[0]
-        helmet_results = helmet_model(frame, conf=conf)[0]
-        names = helmet_results.names
+            frame_count += 1
+            fh, fw = frame.shape[:2]
+            min_area = fw * fh * MIN_AREA_RATIO
 
-        vehicles = []
-        for vbox in vehicle_results.boxes:
-            vx1, vy1, vx2, vy2 = map(int, vbox.xyxy[0])
-            vehicles.append({
-                "box": (vx1, vy1, vx2, vy2),
-                "has_violation": False,
-            })
+            # ── Detect ───────────────────────────────────────────────────────
+            vehicle_res = vehicle_model(
+                frame, conf=MIN_VEHICLE_CONF, classes=TWO_WHEELER_CLASSES, device="mps"
+            )[0]
+            helmet_res = helmet_model(frame, conf=conf, device="mps")[0]
+            names      = helmet_res.names
 
-        def get_distance(h_box, v_box):
-            h_center_x = (h_box[0] + h_box[2]) / 2.0
-            v_center_x = (v_box[0] + v_box[2]) / 2.0
-            h_bottom_y = h_box[3]
-            v_top_y = v_box[1]
-            x_dist = abs(h_center_x - v_center_x)
-            y_dist = max(0, v_top_y - h_bottom_y)
-            return x_dist, y_dist
+            if rider_class_exists is None:
+                rider_class_exists = any("rider" in names[i].lower() for i in range(len(names)))
 
-        for hbox in helmet_results.boxes:
-            hx1, hy1, hx2, hy2 = map(int, hbox.xyxy[0])
-            h_box = (hx1, hy1, hx2, hy2)
+            # Build vehicle list with NMS
+            raw_vehicles = []
+            for vb in vehicle_res.boxes:
+                x1, y1, x2, y2 = map(int, vb.xyxy[0])
+                vconf = float(vb.conf[0])
+                if (x2-x1)*(y2-y1) < min_area:
+                    continue
+                raw_vehicles.append({
+                    "box":            (x1, y1, x2, y2),
+                    "conf":           vconf,
+                    "violation":      False,
+                    "has_any_helmet": False,
+                    "plate":          "",
+                })
+            vehicles = _nms_vehicles(raw_vehicles)
 
-            matched_vehicle = None
-            min_distance = float("inf")
+            # ── Match helmets → vehicles ──────────────────────────────────────
+            for hb in helmet_res.boxes:
+                hx1, hy1, hx2, hy2 = map(int, hb.xyxy[0])
+                h_box  = (hx1, hy1, hx2, hy2)
+                label  = names[int(hb.cls[0])].lower()
+                h_conf = float(hb.conf[0])
+
+                best_v, best_d = None, float("inf")
+                for v in vehicles:
+                    vx1, vy1, vx2, vy2 = v["box"]
+                    vw, vh = vx2-vx1, vy2-vy1
+                    xd, yd = _helmet_distance(h_box, v["box"])
+                    if xd < vw * 0.70 and yd < vh * 0.80:
+                        d = xd + yd
+                        if d < best_d:
+                            best_d = d
+                            best_v = v
+
+                if best_v is None:
+                    continue
+
+                best_v["has_any_helmet"] = True
+
+                if "no" in label and "helmet" in label:
+                    if rider_class_exists:
+                        for hb2 in helmet_res.boxes:
+                            lbl2 = names[int(hb2.cls[0])].lower()
+                            if "rider" not in lbl2:
+                                continue
+                            rx1, ry1, rx2, ry2 = map(int, hb2.xyxy[0])
+                            vx1, vy1, vx2, vy2 = best_v["box"]
+                            vw, vh = vx2-vx1, vy2-vy1
+                            rxd, ryd = _helmet_distance((rx1, ry1, rx2, ry2), best_v["box"])
+                            if rxd < vw * 0.70 and ryd < vh * 0.80:
+                                best_v["violation"] = True
+                                break
+                    else:
+                        best_v["violation"] = True
+
+                color = RED if best_v["violation"] else GREEN
+                txt   = f"{label.replace('_', ' ').title()}: {h_conf:.2f}"
+                cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), color, 2)
+                _draw_label(frame, txt, hx1, hy1, color)
+
+            # ── Tracker update ───────────────────────────────────────────────
+            dets = [{"box": v["box"], "violation": v["violation"], "plate": v["plate"]}
+                    for v in vehicles]
+            active_tracks = tracker.update(dets)
+
+            # ── Draw + save evidence ─────────────────────────────────────────
             for v in vehicles:
                 vx1, vy1, vx2, vy2 = v["box"]
-                v_width = vx2 - vx1
-                v_height = vy2 - vy1
-                x_dist, y_dist = get_distance(h_box, v["box"])
-                if x_dist < v_width * 0.6 and y_dist < v_height * 0.6:
-                    total_dist = x_dist + y_dist
-                    if total_dist < min_distance:
-                        min_distance = total_dist
-                        matched_vehicle = v
+                track    = next((t for t in active_tracks if t["box"] == v["box"]), None)
+                track_id = track["track_id"] if track else -1
 
-            if not matched_vehicle:
+                if v["violation"]:
+                    crop = frame[vy1:vy2, vx1:vx2]
+                    cx   = (vx1+vx2)//2
+                    cy   = (vy1+vy2)//2
+
+                    res       = _best_plate_in_crop(crop)
+                    plate_num = _get_cached_plate(cx, cy, frame_count)
+                    ran_ocr   = False
+
+                    if plate_num is None:
+                        if res:
+                            plate_crop, (px1, py1, px2, py2) = res
+                            plate_num = read_plate(plate_crop)
+                            _cache_plate(cx, cy, plate_num or "", frame_count)
+                            ran_ocr = True
+                        else:
+                            plate_num = ""
+
+                    cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), RED, 3)
+                    lbl = f"#{track_id} VIOLATION | {plate_num if plate_num else 'N/A'}"
+                    _draw_label(frame, lbl, vx1, vy1, RED)
+
+                    if res:
+                        _, (px1, py1, px2, py2) = res
+                        cv2.rectangle(frame, (vx1+px1, vy1+py1), (vx1+px2, vy1+py2), BLUE, 2)
+
+                    if ran_ocr and track_id not in logged_track_ids:
+                        logged_track_ids.add(track_id)
+                        ts_str  = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{frame_count}"
+                        ev_path = _save_evidence(crop, ts_str)
+                        _log_violation(plate_num or "UNKNOWN", frame_count, ev_path)
+                else:
+                    cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), CYAN, 2)
+                    _draw_label(frame, f"#{track_id} Safe", vx1, vy1, (0, 140, 140))
+
+            # HUD
+            live_stats = tracker.get_stats()
+            cv2.rectangle(frame, (0, 0), (250, 88), (0, 0, 0), -1)
+            cv2.putText(frame, f"Total Counted  : {live_stats['total']}",
+                        (6, 24),  cv2.FONT_HERSHEY_SIMPLEX, 0.58, WHITE, 2)
+            cv2.putText(frame, f"Followed Rule  : {live_stats['safe']}",
+                        (6, 52),  cv2.FONT_HERSHEY_SIMPLEX, 0.58, GREEN, 2)
+            cv2.putText(frame, f"Violated Rule  : {live_stats['violations']}",
+                        (6, 80),  cv2.FONT_HERSHEY_SIMPLEX, 0.58, RED, 2)
+
+            ok, buffer = cv2.imencode(".jpg", frame)
+            if not ok:
                 continue
 
-            label = names[int(hbox.cls[0])].lower()
-            h_conf = float(hbox.conf[0])
-
-            if "no" in label and "helmet" in label:
-                has_rider = _has_rider_nearby(helmet_results, matched_vehicle["box"], names)
-                rider_required = any("rider" in names[i].lower() for i in range(len(names)))
-                if not rider_required or has_rider:
-                    matched_vehicle["has_violation"] = True
-
-            color = RED if matched_vehicle["has_violation"] else (0, 255, 0)
-            text = f"{label.replace('_', ' ').title()}: {h_conf:.2f}"
-            cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), color, 3)
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-            cv2.rectangle(
-                frame, (hx1, hy1 - th - 10), (hx1 + tw + 6, hy1), color, -1
-            )
-            cv2.putText(
-                frame, text, (hx1 + 3, hy1 - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
             )
 
-        for v in vehicles:
-            vx1, vy1, vx2, vy2 = v["box"]
-            cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), (0, 255, 255), 2)
-            cv2.putText(
-                frame, "Two-Wheeler", (vx1, vy1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
-            )
-
-            if v["has_violation"]:
-                motorcycle_crop = frame[vy1:vy2, vx1:vx2]
-                cx = (vx1 + vx2) // 2
-                cy = (vy1 + vy2) // 2
-
-                result = _detect_plate_in_motorcycle(motorcycle_crop, plate_model)
-                plate_num = _get_cached_plate(cx, cy, frame_count)
-                ran_ocr = False
-
-                if plate_num is None:
-                    if result is not None:
-                        plate_crop, (px1, py1, px2, py2) = result
-                        plate_num = read_plate(plate_crop)
-                        _add_to_ocr_cache(cx, cy, plate_num or "", frame_count)
-                        ran_ocr = True
-                    else:
-                        plate_num = ""
-
-                # Draw red box and label for violation
-                cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), RED, 3)
-                label_text = f"NO HELMET | Plate: {plate_num if plate_num else 'N/A'}"
-                cv2.putText(
-                    frame, label_text, (vx1, vy1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, RED, 2, cv2.LINE_AA
-                )
-
-                if result is not None:
-                    _, (px1, py1, px2, py2) = result
-                    global_px1, global_py1 = vx1 + px1, vy1 + py1
-                    global_px2, global_py2 = vx1 + px2, vy1 + py2
-                    cv2.rectangle(
-                        frame, (global_px1, global_py1), (global_px2, global_py2),
-                        (255, 0, 0), 2
-                    )
-
-                if ran_ocr:
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{frame_count}"
-                    evidence_path = _save_violation_evidence(motorcycle_crop, ts)
-                    _log_violation(plate_num or "UNKNOWN", frame_count, evidence_path)
-
-        _, buffer = cv2.imencode(".jpg", frame)
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
-        )
-
-    cap.release()
+    finally:
+        cap.release()

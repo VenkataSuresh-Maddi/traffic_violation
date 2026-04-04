@@ -12,5 +12,6 @@ model.train(
     lrf=0.01,
     patience=15,
     project=".",
-    name="helmet_training"
+    name="helmet_training",
+    device="mps"
 )

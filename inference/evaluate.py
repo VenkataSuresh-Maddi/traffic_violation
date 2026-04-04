@@ -3,7 +3,7 @@ import numpy as np
 
 model = YOLO("models/best.pt")
 
-metrics = model.val(conf=0.4, iou=0.6)
+metrics = model.val(conf=0.4, iou=0.6, device="mps")
 
 precision = metrics.box.p.mean()
 recall = metrics.box.r.mean()
